@@ -60,5 +60,9 @@ def get_config(environment_name):
     config.add_goal_arrow = False
     config.timestep = 0.005
     config.episode_length_in_seconds = 20
+    # Per-limb context arm: urma (stock) | dk | d | k | empty | vme | matme  (see context/limb_context.py)
+    config.context_arm = "urma"
+    # Root of {vme,matme}/<robot_dir_name>.json latent files (needed for vme / matme)
+    config.latent_dir = ""
 
     return config

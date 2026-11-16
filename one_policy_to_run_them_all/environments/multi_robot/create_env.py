@@ -52,7 +52,9 @@ def create_env(config):
                 multi_robot_max_observation_size=max_observation_size,
                 multi_robot_max_action_size=max_action_size,
                 nr_envs_per_type=nr_envs_per_type,
-                cpu_id=env_cpu_id
+                cpu_id=env_cpu_id,
+                context_arm=config.environment.context_arm,
+                latent_dir=config.environment.latent_dir,
             )
             env = RecordEpisodeStatistics(env, short_name)
             env.action_space.seed(seed)

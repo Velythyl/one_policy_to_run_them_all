@@ -7,6 +7,7 @@ import gymnasium as gym
 from dm_control import mjcf
 import pygame
 
+from one_policy_to_run_them_all.context.limb_context import compute_name_to_description_vector
 from one_policy_to_run_them_all.environments.barkour_vb.viewer import MujocoViewer
 from one_policy_to_run_them_all.environments.barkour_vb.control_functions.handler import get_control_function
 from one_policy_to_run_them_all.environments.barkour_vb.command_functions.handler import get_command_function
@@ -41,13 +42,15 @@ class BarkourVB(gym.Env):
                  missing_value,
                  add_goal_arrow, timestep, episode_length_in_seconds, total_nr_envs,
                  multi_robot_max_observation_size=-1, multi_robot_max_action_size=-1, nr_envs_per_type=1,
-                 cpu_id=None):
+                 cpu_id=None, context_arm="urma", latent_dir=""):
         
         if cpu_id is not None:
             p = psutil.Process()
             p.cpu_affinity([cpu_id,])
 
         self.seed = seed
+        self.context_arm = context_arm
+        self.latent_dir = latent_dir
         self.mode = mode
         self.missing_value = missing_value
         self.add_goal_arrow = add_goal_arrow
@@ -325,102 +328,10 @@ class BarkourVB(gym.Env):
 
 
     def get_name_to_description_vector(self):
-        name_to_description_vector = {}
-
-        # Save initial state
-        qpos_old, qvel_old = self.data.qpos.copy(), self.data.qvel.copy()
-
-        # Move to initial position
-        qpos, qvel = get_initial_state_function("default", self).setup()
-        self.data.qpos[:] = qpos
-        self.data.qvel[:] = qvel
-        mujoco.mj_forward(self.model, self.data)
-
-        trunk_pos = self.data.body("trunk")
-
-        # Calculate robot width, length and height
-        relative_geom_positions = self.data.geom_xpos - trunk_pos.xpos
-        for i in range(len(relative_geom_positions)):
-            relative_geom_positions[i] = np.matmul(trunk_pos.xmat.reshape(3, 3).T, relative_geom_positions[i])
-
-        relative_joint_positions = np.zeros((len(self.joint_names), 3))
-        for i, joint in enumerate(self.joint_names):
-            relative_joint_positions[i] = self.data.joint(joint).xanchor - trunk_pos.xpos
-            relative_joint_positions[i] = np.matmul(trunk_pos.xmat.reshape(3, 3).T, relative_joint_positions[i])
-
-        rotated_geom_sizes = np.zeros_like(self.model.geom_size)
-        for i in range(len(rotated_geom_sizes)):
-            global_frame_geom_size = np.matmul(self.data.geom_xmat[i].reshape(3, 3), self.model.geom_size[i])
-            trunk_frame_geom_size = np.matmul(trunk_pos.xmat.reshape(3, 3).T, global_frame_geom_size)
-            rotated_geom_sizes[i] = np.abs(trunk_frame_geom_size)
-
-        relative_geom_positions_minus_geom_size = relative_geom_positions.copy()
-        relative_geom_positions_plus_geom_size = relative_geom_positions.copy()
-        for i in range(len(relative_geom_positions)):
-            relative_geom_positions_minus_geom_size[i] -= rotated_geom_sizes[i]
-            relative_geom_positions_plus_geom_size[i] += rotated_geom_sizes[i]
-
-        # Ignore the first geom (floor)
-        min_x = min(min(relative_geom_positions_minus_geom_size[1:, 0]), min(relative_geom_positions_plus_geom_size[1:, 0]), min(relative_joint_positions[:, 0]))
-        min_y = min(min(relative_geom_positions_minus_geom_size[1:, 1]), min(relative_geom_positions_plus_geom_size[1:, 1]), min(relative_joint_positions[:, 1]))
-        min_z = min(min(relative_geom_positions_minus_geom_size[1:, 2]), min(relative_geom_positions_plus_geom_size[1:, 2]), min(relative_joint_positions[:, 2]))
-        max_x = max(max(relative_geom_positions_minus_geom_size[1:, 0]), max(relative_geom_positions_plus_geom_size[1:, 0]), max(relative_joint_positions[:, 0]))
-        max_y = max(max(relative_geom_positions_minus_geom_size[1:, 1]), max(relative_geom_positions_plus_geom_size[1:, 1]), max(relative_joint_positions[:, 1]))
-        max_z = max(max(relative_geom_positions_minus_geom_size[1:, 2]), max(relative_geom_positions_plus_geom_size[1:, 2]), max(relative_joint_positions[:, 2]))
-        mins = np.array([min_x, min_y, min_z])
-        self.robot_length = max_x - min_x
-        self.robot_width = max_y - min_y
-        self.robot_height = max_z - min_z
-        self.robot_dimensions = np.array([self.robot_length, self.robot_width, self.robot_height])
-
-        self.gains_and_action_scaling_factor = np.array([self.control_function.seen_p_gain, self.control_function.seen_d_gain, self.control_function.seen_scaling_factor])
-        self.mass = np.array([np.sum(self.domain_randomization_seen_robot_function.seen_body_mass)])
-        
-        for foot_name in self.foot_names:
-            foot = self.data.geom(foot_name)
-            relative_foot_pos = foot.xpos - trunk_pos.xpos
-            relative_foot_pos = np.matmul(trunk_pos.xmat.reshape(3, 3).T, relative_foot_pos)
-            relative_foot_pos_normalized = (relative_foot_pos - mins) / self.robot_dimensions
-            name_to_description_vector[foot_name] = np.concatenate([
-                (relative_foot_pos_normalized / 0.5) - 1.0,
-                (self.gains_and_action_scaling_factor / [100.0 / 2, 2.0 / 2, 0.8 / 2]) - 1.0,
-                (self.mass / (170.0 / 2)) - 1.0,
-                (self.robot_dimensions / (2.0 / 2)) - 1.0
-            ])
-
-        for i, joint_name in enumerate(self.joint_names):
-            joint = self.data.joint(joint_name)
-            relative_joint_pos = joint.xanchor - trunk_pos.xpos
-            relative_joint_pos = np.matmul(trunk_pos.xmat.reshape(3, 3).T, relative_joint_pos)
-            relative_joint_pos_normalized = (relative_joint_pos - mins) / self.robot_dimensions
-            joint_axis = joint.xaxis
-            relative_joint_axis = np.matmul(trunk_pos.xmat.reshape(3, 3).T, joint_axis)
-            name_to_description_vector[joint_name] = np.concatenate([
-                (relative_joint_pos_normalized / 0.5) - 1.0,
-                relative_joint_axis,
-                np.array([self.joint_nr_direct_child_joints[i] - 1.0]),
-                np.array([self.domain_randomization_seen_robot_function.seen_joint_nominal_position[i] / 4.6]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_torque_limit[i] / (1000.0 / 2)) - 1.0]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_joint_velocity[i] / (35.0 / 2)) - 1.0]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_joint_damping[i] / (10.0 / 2)) - 1.0]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_joint_armature[i] / (0.2 / 2)) - 1.0]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_joint_stiffness[i] / (30.0 / 2)) - 1.0]),
-                np.array([(self.domain_randomization_seen_robot_function.seen_joint_frictionloss[i] / (1.2 / 2)) - 1.0]),
-                self.domain_randomization_seen_robot_function.seen_joint_range[i] / 4.6,
-                (self.gains_and_action_scaling_factor / [100.0 / 2, 2.0 / 2, 0.8 / 2]) - 1.0,
-                (self.mass / (170.0 / 2)) - 1.0,
-                (self.robot_dimensions / (2.0 / 2)) - 1.0
-            ])
-
-        self.dynamic_joint_description_size = name_to_description_vector[self.joint_names[0]].shape[0]
-        self.dynamic_foot_description_size = name_to_description_vector[self.foot_names[0]].shape[0]
-
-        # Restore initial state
-        self.data.qpos[:] = qpos_old
-        self.data.qvel[:] = qvel_old
-        mujoco.mj_forward(self.model, self.data)
-
-        return name_to_description_vector
+        # Shared per-limb context (see one_policy_to_run_them_all/context/limb_context.py)
+        return compute_name_to_description_vector(
+            self, get_initial_state_function("default", self).setup()
+        )
 
 
     def get_observation_space(self, multi_robot_max_observation_size):
