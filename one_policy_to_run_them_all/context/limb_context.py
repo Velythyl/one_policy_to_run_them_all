@@ -11,7 +11,7 @@ Arms (``environment.context_arm``)
 ``dk``     [K | D | G]                     non-latent family, 53 wide
 ``k``      [K | 0 | G]                     non-latent family
 ``d``      [0 | D | G]                     non-latent family
-``empty``  [0 | 0 | G]                     non-latent family
+``empty``  [0 | 0 | 0]                     non-latent family: the whole token is zeros
 ``vme``    [VME latent | D | G]            latent family, L + 17 wide
 ``matme``  [MatME latent | D | G]          latent family
 
@@ -19,12 +19,13 @@ Within a family every arm has the same width, so the policy / critic networks ar
 (same parameter shapes); masked blocks are zeros.
 
 G = the robot-global copies URMA appends to every token (p_gain, d_gain, action_scaling_factor,
-total mass, length/width/height). They are KEPT IN EVERY ARM, like ``general_state``: they are the
-same for all joints of a robot, so they carry no per-limb information; with ``empty`` all joint
-tokens of a robot are identical (the honest no-context baseline, no joint IDs).
+total mass, length/width/height). They stay in the tokens of every arm EXCEPT ``empty`` (user
+decision 2026-11-16): ``empty`` joint and foot descriptions are literally all zeros, so all tokens of
+a robot are identical (the honest no-context baseline, no joint IDs). State observations and the
+robot-global fields in ``general_state`` are untouched in every arm.
 
 Foot tokens always keep URMA's shape: [foot position (3) | G (7)]. Foot position is kinematics,
-so it is zeroed in every arm without K (``empty``, ``d``, ``vme``, ``matme``).
+so it is zeroed in every arm without K (``empty``, ``d``, ``vme``, ``matme``); G is zeroed in ``empty``.
 
 D values use URMA's domain-randomised "seen" values (``seen_body_mass``, ``seen_joint_*``) and are
 recomputed whenever ``handle_domain_randomization`` resamples the robot (it calls
@@ -98,7 +99,7 @@ _FIELD_WIDTH = dict(K_FIELDS + D_FIELDS + G_FIELDS)
 
 ARM_BLOCKS_ON = {
     "urma": {"K", "D", "G"}, "dk": {"K", "D", "G"}, "k": {"K", "G"}, "d": {"D", "G"},
-    "empty": {"G"}, "vme": {"LAT", "D", "G"}, "matme": {"LAT", "D", "G"},
+    "empty": set(), "vme": {"LAT", "D", "G"}, "matme": {"LAT", "D", "G"},
 }
 
 
@@ -367,6 +368,8 @@ def check_arms_distinct(env, fields, g, st, arm, latent_dir):
         for b in names[i + 1:]:
             if mats[a][0].shape == mats[b][0].shape and np.array_equal(mats[a][0], mats[b][0]):
                 raise RuntimeError(f"{robot_dir_name(env)}: context arms {a} and {b} give identical joint descriptions")
+    if np.any(mats["empty"][0]):
+        raise RuntimeError(f"{robot_dir_name(env)}: empty arm joint description is not all zeros")
     for a in names:
         mat, lay = mats[a]
         for block in ARM_BLOCKS_ON[a] - {"G"}:
@@ -406,10 +409,11 @@ def compute_name_to_description_vector(env, default_qpos_qvel, foot_geom_suffix=
         env._limb_context_checked = True
 
     out = {}
-    foot_k_on = "K" in ARM_BLOCKS_ON[arm]
+    foot_k_on, foot_g_on = "K" in ARM_BLOCKS_ON[arm], "G" in ARM_BLOCKS_ON[arm]
     for name in env.foot_names:
+        foot_g = np.concatenate([g["p_d_gain_scaling"], g["robot_mass"], g["robot_dims"]])
         out[name] = np.concatenate([feet[name] if foot_k_on else np.zeros(3),
-                                    g["p_d_gain_scaling"], g["robot_mass"], g["robot_dims"]])
+                                    foot_g if foot_g_on else np.zeros(7)])
     for i, name in enumerate(env.joint_names):
         out[name] = joint_matrix[i]
 

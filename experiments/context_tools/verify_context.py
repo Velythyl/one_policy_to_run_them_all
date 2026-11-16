@@ -5,7 +5,7 @@
 For every robot x arm (default pose and 3 DR samples, seed 0):
   * widths: equal within an arm family across all robots; foot width 10 everywhere
   * K / D / LAT / G column sets disjoint; switched-off blocks exactly zero
-  * empty: per-limb columns all zero (only the robot-global G copies remain)
+  * empty: joint AND foot tokens all zero (G copies zeroed too); other arms keep G
   * vme / matme: only latent + D (+ G) columns non-zero; latent equals the file's latent
   * dk restricted to URMA's fields == stock URMA values (bitwise), G == stock G,
     D link fields recomputed after DR (seen values), and urma arm == stock
@@ -108,11 +108,13 @@ for robot in ALL_ROBOTS:
                     assert not np.any(sub), (robot, arm, b, "switched-off block non-zero")
             if "K" not in lc.ARM_BLOCKS_ON[arm]:
                 assert not np.any(F[:, :3]), (robot, arm, "foot pos must be zero without K")
+            if "G" not in lc.ARM_BLOCKS_ON[arm]:
+                assert not np.any(F[:, 3:]), (robot, arm, "foot G must be zero")
+            else:
+                assert np.any(F[:, 3:]), (robot, arm, "foot G missing")
         if arm == "empty":
-            J = per_sample[0][0]
-            per_limb = np.setdiff1d(np.arange(J.shape[1]), lay.block_columns("G"))
-            assert not np.any(J[:, per_limb]), (robot, "empty per-limb not all zero")
-            assert np.all(J == J[0]), (robot, "empty: joint tokens differ within robot")
+            for J, F in per_sample:
+                assert not np.any(J) and not np.any(F), (robot, "empty tokens not all zero")
         if arm in lc.LATENT_ARMS:
             lat = lc.load_latents(latent_dir, arm, lc.robot_dir_name(env), env.model)
             want = np.stack([lat[b] for b in env._limb_context_static["body_names"]])
@@ -121,7 +123,7 @@ for robot in ALL_ROBOTS:
     Js = np.stack([stock[f"{robot}/0/{j}"] for j in envs["urma"][0].joint_names])
     g_stock = Js[:, stock_layout.block_columns("G")]
     for arm in ARMS:
-        if arm == "urma":
+        if arm in ("urma", "empty"):
             continue
         lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if arm in lc.LATENT_ARMS else 0
         assert np.array_equal(mats[arm][0][:, lc.joint_layout(arm, lat_dim).block_columns("G")], g_stock), (robot, arm, "G differs")
