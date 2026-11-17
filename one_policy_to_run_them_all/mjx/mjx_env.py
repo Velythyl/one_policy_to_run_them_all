@@ -153,6 +153,8 @@ class MJXRobotEnv:
     impl: str = "jax"
     nr_envs_per_type: int = 1  # for the curriculum (total type steps = env steps * nr_envs_per_type)
     model_variant: str = "native"  # native | feet_only (contacts only floor vs feet/trunk/hip)
+    eval_mode: bool = False  # CPU env.eval: curriculum coefficient 1.0
+    contacts_per_env: int = 64
 
     def __post_init__(self):
         sp, c = self.spec, self.spec.cfg
@@ -199,23 +201,34 @@ class MJXRobotEnv:
         self.def_geom_friction = f64(d["geom_friction"])
         self.def_geom_size = f64(d["geom_size"])
         self.def_solref = f64(d["geom_solref"])
-        self.feet_dr = np.asarray(sp.struct["dr_foot_geoms"], dtype=int)
+        st = sp.struct
+        self.seen_struct, self.model_struct = st["seen_dr"], st["model_dr"]
+        self.feet_dr = np.asarray(st["seen_dr"]["foot_size_geoms"], dtype=int)  # geom_size DR (seen fn)
+        self.feet_fric = np.asarray(st["model_dr"]["friction_feet_geoms"], dtype=int)  # geom_friction DR (model fn)
+        self.foot_noise_power = int(st["seen_dr"]["foot_size_noise_power"])
         # contact group masks over geoms
         ng = m.ngeom
         def mask(ids):
             mk = np.zeros(ng, dtype=bool); mk[list(ids)] = True; return mk
         self.floor_mask = mask(c["collision_groups"]["floor"])
-        self.foot_masks = np.stack([mask(sp.group_geoms([g])) for g in sp.struct["foot_groups"]])
-        self.rc_geoms = np.asarray(sp.group_geoms(sp.struct["reward_collision_geoms"]), dtype=int)
-        self.rc_trunk_mask = mask(sp.group_geoms(sp.struct["reward_trunk_groups"])) if sp.struct["reward_trunk_groups"] else np.zeros(ng, bool)
-        term = sp.struct["termination"]
-        self.term_kind = term[0]
-        if term[0] == "contact":
-            self.term_mask = mask(sp.group_geoms(term[1]))
-        else:
-            self.term_height = float(term[1])
-        self.sym_pairs = np.asarray(sp.struct["symmetry_pairs"], dtype=int)
-        self.nominal_diff_joints = np.asarray(sp.struct["nominal_diff_joints"], dtype=int)
+        groups = c["collision_groups"]
+        self.foot_masks = np.stack([mask(groups.get(f, [])) for f in c["foot_names"]])
+        self.rc_geoms = np.asarray(sp.group_geoms(st["reward_collision_geoms"]), dtype=int)
+        self.rc_trunk_mask = mask(sp.group_geoms(st["reward_trunk_groups"])) if st["reward_trunk_groups"] else np.zeros(ng, bool)
+        term = st["termination"]
+        self.term_kind = term["kind"]
+        if self.term_kind == "contact":
+            self.term_mask = mask(sp.group_geoms(term["groups"]))
+        elif self.term_kind in ("height", "geom_height"):
+            self.term_height = float(term["threshold"])
+            self.term_geom = int(term.get("geom", -1))
+        self.sym_pairs = np.asarray(st["symmetry_pairs"], dtype=int).reshape(-1, 2)
+        self.air_pairs = np.asarray(st["air_pairs"], dtype=int).reshape(-1, 2)
+        self.nominal_diff_joints = np.asarray(st["nominal_diff_joints"], dtype=int)
+        self.foot_obs_mode = st["foot_obs_mode"]
+        self.obs_timer_feet = np.asarray(st["obs_timer_feet"], dtype=int)
+        cn = c.get("complete_nominal_joint_position") or []
+        self.qpos_base = np.asarray(cn, dtype=np.float64) if len(cn) else np.asarray(m.qpos0, dtype=np.float64)
         # context: static parts at the nominal pose (see extract_robot_config.py)
         ctx = c["context"]
         self.ctx_fields = {k: f64(v) for k, v in ctx["fields"].items()}
@@ -247,12 +260,19 @@ class MJXRobotEnv:
             add_p=j(0.0), add_d=j(0.0), add_scale=j(0.0),
             p_noise=j(1.0), d_noise=j(1.0), motor_noise=j(1.0), pos_offset=j(np.zeros(self.nu)),
             body_mass_trunk=j(self.def_body_mass[1]), body_inertia_trunk=j(self.def_trunk_inertia),
-            body_ipos_trunk=j(self.def_trunk_com), foot_size=j(self.def_geom_size[self.feet_dr, 0]),
+            body_ipos_trunk=j(self.def_trunk_com), foot_size=j(self.def_geom_size[self.feet_dr, 0]) if len(self.feet_dr) else j(np.zeros(0)),
             damping=j(self.def_damping), armature=j(self.def_armature), stiffness=j(self.def_stiffness),
             frictionloss=j(self.def_friction), friction_ground=j(self.def_geom_friction[0]),
-            friction_feet=j(self.def_geom_friction[self.feet_dr]), solref=j(self.def_solref[:, :2]),
+            friction_feet=j(self._fric_target_default()), solref=j(self.def_solref[:, :2]),
             gravity_z=j(self.mj_model.opt.gravity[2]), delay_mixed=jnp.array(False),
         )
+
+    def _fric_target_default(self):
+        """friction_feet holds the per-geom friction rows the model DR writes: the foot geoms
+        (ground_feet mode) or every geom (sea_snake 'all' mode)."""
+        if self.model_struct["friction_mode"] == "ground_feet":
+            return self.def_geom_friction[self.feet_fric]
+        return self.def_geom_friction
 
     def _sample_dr(self, key, old: DR):
         S, U, M, A = self.P["seen"], self.P["unseen"], self.P["model_dr"], self.P["action_delay"]
@@ -262,7 +282,7 @@ class MJXRobotEnv:
         # unseen_robot_functions/default.py
         trunk_mass_nf = u(1 - U["trunk_mass_factor"], 1 + U["trunk_mass_factor"])
         com_nf = u(1 - U["com_displacement_factor"], 1 + U["com_displacement_factor"])
-        foot_nf = u(1 - U["foot_size_factor"], 1 + U["foot_size_factor"])
+        foot_nf = u(1 - U.get("foot_size_factor", 0.0), 1 + U.get("foot_size_factor", 0.0))
         damp_nf = u(1 - U["joint_damping_factor"], 1 + U["joint_damping_factor"])
         arm_nf = u(1 - U["joint_armature_factor"], 1 + U["joint_armature_factor"])
         stiff_nf = u(1 - U["joint_stiffness_factor"], 1 + U["joint_stiffness_factor"])
@@ -277,16 +297,42 @@ class MJXRobotEnv:
         mass_trunk = seen_trunk * trunk_mass_nf
         inertia_trunk = self.def_trunk_inertia * (mass_trunk / self.def_body_mass[1])
         ipos = (self.def_trunk_com + u(S["add_com_displacement_min"], S["add_com_displacement_max"])) * com_nf
-        foot_size = jnp.full(len(self.feet_dr), u(S["foot_size_min"], S["foot_size_max"]) * foot_nf ** self.spec.struct["foot_size_noise_power"])
+        if len(self.feet_dr):
+            foot_size = jnp.full(len(self.feet_dr), u(S["foot_size_min"], S["foot_size_max"]) * foot_nf ** self.foot_noise_power)
+        else:
+            foot_size = jnp.zeros(0)
         nominal = self.def_nominal + u(S["add_joint_nominal_position_min"], S["add_joint_nominal_position_max"], (n,))
         torque = self.def_torque * (1 + u(-S["torque_limit_factor"], S["torque_limit_factor"], self.def_torque.shape))
         vel = self.def_vel * (1 + u(-S["joint_velocity_factor"], S["joint_velocity_factor"], self.def_vel.shape))
         rng = self.def_range + u(S["add_joint_range_min"], S["add_joint_range_max"], self.def_range.shape)
-        damping = jnp.where(stay, self.def_damping, u(S["joint_damping_min"], S["joint_damping_max"], self.def_damping.shape))
+        sd = self.seen_struct
+        shp = self.def_damping.shape
+        if sd["damping_mode"] == "uniform":
+            damp_s = u(S["joint_damping_min"], S["joint_damping_max"], shp)
+        elif sd["damping_mode"] == "add_clamp":  # talos
+            damp_s = jnp.maximum(0.0, self.def_damping + u(S["add_joint_damping_min"], S["add_joint_damping_max"], shp))
+        else:  # factor (cassie)
+            damp_s = self.def_damping * (1 + u(-S["joint_damping_factor"], S["joint_damping_factor"], shp))
+        if sd["frictionloss_mode"] == "uniform":
+            fric_s = u(S["joint_friction_loss_min"], S["joint_friction_loss_max"], self.def_friction.shape)
+        elif sd["frictionloss_mode"] == "add_clamp":
+            fric_s = jnp.maximum(0.0, self.def_friction + u(S["add_joint_friction_loss_min"], S["add_joint_friction_loss_max"], self.def_friction.shape))
+        else:
+            raise NotImplementedError(sd["frictionloss_mode"])
+        arm_s = u(S["joint_armature_min"], S["joint_armature_max"], self.def_armature.shape)
+        stiff_s = u(S["joint_stiffness_min"], S["joint_stiffness_max"], self.def_stiffness.shape)
+        keep = sd["keep_default"]  # indices that keep their default even when randomised (cassie, atlas)
+        if "damping" in keep:
+            damp_s = damp_s.at[jnp.asarray(keep["damping"])].set(self.def_damping[keep["damping"]])
+        if "stiffness" in keep:
+            stiff_s = stiff_s.at[jnp.asarray(keep["stiffness"])].set(self.def_stiffness[keep["stiffness"]])
+        assert set(keep) <= {"damping", "stiffness"}, keep
+        damping = jnp.where(stay, self.def_damping, damp_s)
         # upstream typo: the stay-at-default branch sets `seen_armature`, so armature keeps its previous sample
-        armature = jnp.where(stay, old.seen_armature, u(S["joint_armature_min"], S["joint_armature_max"], self.def_armature.shape))
-        stiffness = jnp.where(stay, self.def_stiffness, u(S["joint_stiffness_min"], S["joint_stiffness_max"], self.def_stiffness.shape))
-        friction = jnp.where(stay, self.def_friction, u(S["joint_friction_loss_min"], S["joint_friction_loss_max"], self.def_friction.shape))
+        assert sd["armature_stay_typo"]
+        armature = jnp.where(stay, old.seen_armature, arm_s)
+        stiffness = jnp.where(stay, self.def_stiffness, stiff_s)
+        friction = jnp.where(stay, self.def_friction, fric_s)
         add_p = u(S["add_p_gain_min"], S["add_p_gain_max"])
         add_d = u(S["add_d_gain_min"], S["add_d_gain_max"])
         add_s = u(S["add_scaling_factor_min"], S["add_scaling_factor_max"])
@@ -294,10 +340,16 @@ class MJXRobotEnv:
         it = u(0.0, 1.0)
         lerp = lambda lo, hi, t: lo + (hi - lo) * t
         tang = lerp(M["friction_tangential_min"], M["friction_tangential_max"], it)
-        fg = jnp.stack([tang, lerp(M["friction_torsional_ground_min"], M["friction_torsional_ground_max"], it),
-                        lerp(M["friction_rolling_ground_min"], M["friction_rolling_ground_max"], it)])
-        ff = jnp.stack([tang, lerp(M["friction_torsional_feet_min"], M["friction_torsional_feet_max"], it),
-                        lerp(M["friction_rolling_feet_min"], M["friction_rolling_feet_max"], it)])
+        if self.model_struct["friction_mode"] == "ground_feet":
+            fg = jnp.stack([tang, lerp(M["friction_torsional_ground_min"], M["friction_torsional_ground_max"], it),
+                            lerp(M["friction_rolling_ground_min"], M["friction_rolling_ground_max"], it)])
+            ff = jnp.stack([tang, lerp(M["friction_torsional_feet_min"], M["friction_torsional_feet_max"], it),
+                            lerp(M["friction_rolling_feet_min"], M["friction_rolling_feet_max"], it)])
+        else:  # sea_snake: one friction triple for every geom
+            fg = jnp.stack([tang, lerp(M["friction_torsional_min"], M["friction_torsional_max"], it),
+                            lerp(M["friction_rolling_min"], M["friction_rolling_max"], it)])
+            ff = fg
+        ff = jnp.broadcast_to(ff, self._fric_target_default().shape)
         it2 = u(0.0, 1.0)
         damp_c = lerp(M["damping_min"], M["damping_max"], it2)
         stiff_c = lerp(M["stiffness_min"], M["stiffness_max"], it2)
@@ -331,8 +383,11 @@ class MJXRobotEnv:
         body_mass = mx.body_mass.at[1].set(dr.body_mass_trunk)
         body_inertia = mx.body_inertia.at[1].set(dr.body_inertia_trunk)
         body_ipos = mx.body_ipos.at[1].set(dr.body_ipos_trunk)
-        geom_size = mx.geom_size.at[self.feet_dr, 0].set(dr.foot_size)
-        geom_friction = mx.geom_friction.at[0].set(dr.friction_ground).at[self.feet_dr].set(dr.friction_feet)
+        geom_size = mx.geom_size.at[self.feet_dr, 0].set(dr.foot_size) if len(self.feet_dr) else mx.geom_size
+        if self.model_struct["friction_mode"] == "ground_feet":
+            geom_friction = mx.geom_friction.at[0].set(dr.friction_ground).at[self.feet_fric].set(dr.friction_feet)
+        else:
+            geom_friction = dr.friction_feet
         geom_solref = mx.geom_solref.at[:, :2].set(dr.solref)
         ctrlrange = jnp.stack([-dr.seen_torque, dr.seen_torque], axis=-1)
         jnt_range = mx.jnt_range.at[1:].set(dr.seen_range)
@@ -425,8 +480,12 @@ class MJXRobotEnv:
         if self.term_kind == "contact":
             tm = jnp.asarray(self.term_mask)
             term = anyw(valid & (tm[g1] | tm[g2]))
-        else:
+        elif self.term_kind == "height":
             term = d.qpos[:, 2] < self.term_height
+        elif self.term_kind == "geom_height":  # atlas: data.geom("middle_chest").xpos[2]
+            term = d.geom_xpos[:, self.term_geom, 2] < self.term_height
+        else:
+            term = jnp.zeros(nr_envs, bool)
         return foot, nr, term
 
     # ------------------------------------------------------------------ physics
@@ -450,13 +509,14 @@ class MJXRobotEnv:
         jvel = dr.seen_vel * u(k[4], -I["joint_velocity_factor"], I["joint_velocity_factor"])
         lin = u(k[5], -I["max_linear_velocity"], I["max_linear_velocity"], (3,))
         ang = u(k[6], -I["max_angular_velocity"], I["max_angular_velocity"], (3,))
-        qpos = jnp.asarray(self.mj_model.qpos0, jnp.float32)
+        qpos = jnp.asarray(self.qpos_base, jnp.float32)  # masked robots: complete nominal pose
         qpos = qpos.at[0:3].set(jnp.array([0.0, 0.0, self.spec.cfg["initial_drop_height"]])).at[3:7].set(quat)
         qpos = qpos.at[self.qpos_j].set(jpos)
         qvel = jnp.zeros(self.mj_model.nv).at[0:3].set(lin).at[3:6].set(ang).at[self.qvel_j].set(jvel)
         return qpos, qvel
 
-    def make_batch_data(self, nr_envs, contacts_per_env=64, constraints_per_env=None):
+    def make_batch_data(self, nr_envs, contacts_per_env=None, constraints_per_env=None):
+        contacts_per_env = contacts_per_env or self.contacts_per_env
         njmax = constraints_per_env or contacts_per_env * 8
         if self.impl == "warp":
             mk = lambda _: mjx.make_data(self.mj_model, impl="warp", naconmax=nr_envs * contacts_per_env, njmax=njmax)
@@ -474,13 +534,16 @@ class MJXRobotEnv:
         ang = d.qvel[3:6] + jax.random.uniform(k[1], (3,), minval=-N["trunk_angular_velocity_noise"], maxval=N["trunk_angular_velocity_noise"])
         jv = d.qvel[self.qvel_j] + jax.random.uniform(k[2], (self.n,), minval=-N["joint_velocity_noise"], maxval=N["joint_velocity_noise"])
         grav = R.T @ jnp.array([0.0, 0.0, -1.0]) + jax.random.uniform(k[3], (3,), minval=-N["gravity_vector_noise"], maxval=N["gravity_vector_noise"])
-        fc = foot_contact.astype(jnp.float32)
-        ft = timers
-        jmask = jax.random.uniform(k[4], (self.n,)) < D["dynamic_dropout_chance"]
-        fmask = jax.random.uniform(k[5], (self.nf,)) < D["dynamic_dropout_chance"]
         mv = 0.0  # missing_value
+        jmask = jax.random.uniform(k[4], (self.n,)) < D["dynamic_dropout_chance"]
         jp, jv, pa = (jnp.where(jmask, mv, x) for x in (jp, jv, current_action))
-        fc, ft = (jnp.where(fmask, mv, x) for x in (fc, ft))
+        if self.foot_obs_mode == "live":
+            fc = foot_contact.astype(jnp.float32)
+            ft = timers[self.obs_timer_feet]
+            fmask = jax.random.uniform(k[5], (self.nf,)) < D["dynamic_dropout_chance"]
+            fc, ft = (jnp.where(fmask, mv, x) for x in (fc, ft))
+        else:  # badger family / sea_snake: foot contact + timer obs are never written (missing_value)
+            fc = ft = jnp.full((self.nf,), mv)
         jstate = jnp.stack([jp / 4.6, jv / 35.0, pa / 10.0], axis=-1)
         fstate = jnp.stack([fc / 0.5 - 1.0, jnp.clip(ft / (5.0 / 2) - 1.0, -1.0, 1.0)], axis=-1)
         lin = jnp.clip((R.T @ d.qvel[0:3]) / 10.0, -1.0, 1.0)
@@ -493,7 +556,7 @@ class MJXRobotEnv:
     # ------------------------------------------------------------------ reward
     def _reward(self, d, dr, goal, action, last_action, prev_vel, timers, foot_contact, nr_coll, type_steps):
         R = self.R
-        cur = jnp.minimum(type_steps / R["curriculum_steps"], 1.0)
+        cur = 1.0 if self.eval_mode else jnp.minimum(type_steps / R["curriculum_steps"], 1.0)
         Rm = quat_to_mat(d.qpos[3:7])
         local_lin = Rm.T @ d.qvel[0:3]
         ang = d.qvel[3:6]
@@ -518,14 +581,17 @@ class MJXRobotEnv:
         vj = d.qvel[self.qvel_j]
         r_vel = cur * R["joint_velocity_coeff"] * -jnp.sum(vj ** 2)
         # upstream precedence quirk kept: (prev - vel / dt)
-        r_acc = cur * R["joint_acceleration_coeff"] * -jnp.sum((prev_vel - d.qvel[6:] / self.dt) ** 2)
-        r_tq = cur * R["joint_torque_coeff"] * -jnp.sum(d.qfrc_actuator[6:] ** 2)
+        r_acc = cur * R["joint_acceleration_coeff"] * -jnp.sum((prev_vel - d.qvel[self.qvel_j] / self.dt) ** 2)
+        r_tq = cur * R["joint_torque_coeff"] * -jnp.sum(d.qfrc_actuator[self.qvel_j] ** 2)
         r_ar = cur * R["action_rate_coeff"] * -jnp.sum((action - last_action) ** 2)
         r_col = cur * R["collision_coeff"] * -nr_coll
         r_h = cur * R["base_height_coeff"] * -((d.qpos[2] - R["nominal_trunk_z"]) ** 2)
-        air = jnp.sum(jnp.where(foot_contact, timers - R["air_time_max"], 0.0))
+        if len(self.air_pairs):
+            air = jnp.sum(jnp.where(foot_contact[self.air_pairs[:, 0]], timers[self.air_pairs[:, 1]] - R["air_time_max"], 0.0))
+        else:
+            air = 0.0
         r_air = cur * R["air_time_coeff"] * air
-        viol = jnp.sum(~foot_contact[self.sym_pairs[:, 0]] & ~foot_contact[self.sym_pairs[:, 1]])
+        viol = jnp.sum(~foot_contact[self.sym_pairs[:, 0]] & ~foot_contact[self.sym_pairs[:, 1]]) if len(self.sym_pairs) else 0.0
         r_sym = cur * R["symmetry_air_coeff"] * -viol
         reward = track_xy + track_yaw + r_z + r_ang + r_pos + r_nom + r_lim + r_vel + r_acc + r_tq + r_ar + r_col + r_h + r_air + r_sym
         reward = jnp.maximum(reward, 0.0)
@@ -542,7 +608,7 @@ class MJXRobotEnv:
         A = int(self.P["action_delay"]["max_nr_delay_steps"])
         zu = jnp.zeros(self.nu)
         return dict(qpos=qpos, qvel=qvel, goal=goal, action_hist=jnp.zeros((A + 1, self.nu)), current_action=zu,
-                    last_action=zu, prev_joint_vel=jnp.zeros(self.mj_model.nv - 6), timers=jnp.zeros(self.nf),
+                    last_action=zu, prev_joint_vel=jnp.zeros(self.n), timers=jnp.zeros(self.nf),
                     episode_step=jnp.zeros((), jnp.int32), steps_done=steps_done, sum_track=jnp.zeros((), jnp.float32),
                     episode_return=jnp.zeros((), jnp.float32), key=k2)
 
@@ -635,6 +701,7 @@ class MJXRobotEnv:
         info["episode_return"] = jnp.where(unstable, s.episode_return, info["episode_return"])
         ep_ret = info["episode_return"]
         info["sim_unstable"] = unstable
+        info["qpos_next"], info["qvel_next"] = d.qpos, d.qvel  # pre-autoreset state (checks only; DCE'd in training)
         info["final_obs"] = obs
         done = info["done"]
         # ---- autoreset of done envs: keep DR, goal and the env's step counter (as on CPU)
@@ -649,7 +716,7 @@ class MJXRobotEnv:
         w = lambda a, b: jnp.where(done.reshape(done.shape + (1,) * (a.ndim - 1)), a, b)
         new_data = merge_data(done, rdata, d, self.impl)
         stepped = dict(goal=goal, action_hist=hist, current_action=action, last_action=action,
-                       prev_joint_vel=d.qvel[:, 6:], timers=timers, episode_step=s.episode_step + 1,
+                       prev_joint_vel=d.qvel[:, self.qvel_j], timers=timers, episode_step=s.episode_step + 1,
                        steps_done=steps_done, sum_track=sum_track, episode_return=ep_ret, key=key)
         fs.pop("qpos"); fs.pop("qvel")
         merged = {k: w(fs[k], stepped[k]) for k in stepped}

@@ -14,6 +14,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments" / "context_tools"))
 from envs import build_env  # noqa: E402
 from one_policy_to_run_them_all.context import limb_context as lc  # noqa: E402
+from one_policy_to_run_them_all.mjx.robot_struct import extract_struct  # noqa: E402
+import inspect, re  # noqa: E402
+
+LATENTS_DUMMY = "/network/scratch/c/charlie.gauthier/urma_context/latents_dummy"
 
 
 def scalars(obj):
@@ -47,7 +51,8 @@ def main():
         qp, qv = init_mod.get_initial_state_function("default", env).setup()
         env.data.qpos[:] = qp; env.data.qvel[:] = qv
         mujoco.mj_forward(m, env.data)
-        suffix = {"atlas": "_back", "bittle": "_1", "nao_v5": "_1", "robotis_op3": "_2", "unitree_g1": "_1", "unitree_h1": "_2"}.get(robot, "")
+        m_suf = re.search(r'foot_geom_suffix="(\w*)"', inspect.getsource(type(env)))
+        suffix = m_suf.group(1) if m_suf else ""
         g, feet, joints_geo = lc._robot_geometry(env, [f + suffix for f in env.foot_names])
         fields, st = lc.limb_fields(env, dof_idx, jnt_idx, joints_geo)
         env.data.qpos[:] = qpos0; env.data.qvel[:] = qvel0
@@ -109,14 +114,21 @@ def main():
             },
             # full CPU description per arm at default values (for verification of the JAX port)
             "cpu_descriptions": {},
+            "foot_geom_suffix": suffix,
+            "eq": {"neq": int(m.neq), "types": [int(t) for t in m.eq_type], "active": [int(a) for a in m.eq_active0]},
         }
-        for arm in ("urma", "dk", "k", "d", "empty"):
-            e2 = build_env(robot, seed=0, context_arm=arm)
+        for arm in ("urma", "dk", "k", "d", "empty", "vme", "vmestar", "matme"):
+            try:
+                e2 = build_env(robot, seed=0, context_arm=arm, latent_dir=LATENTS_DUMMY if arm in lc.LATENT_ARMS else "")
+            except Exception as ex:  # latent file missing for this robot
+                print(robot, arm, "SKIP", repr(ex)[:200], flush=True)
+                continue
             cfg["cpu_descriptions"][arm] = {
                 "joints": tolist(np.stack([e2.name_to_description_vector[j] for j in e2.joint_names])),
                 "feet": tolist(np.stack([e2.name_to_description_vector[f] for f in e2.foot_names])),
             }
             e2.close()
+        cfg["struct"] = extract_struct(build_env(robot, seed=0, context_arm="urma"))
         (out_dir / f"{robot}.json").write_text(json.dumps(cfg))
         print(robot, "ok", env.termination_function.__class__.__name__, flush=True)
         env.close()

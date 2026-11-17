@@ -27,7 +27,10 @@ import numpy as np
 import optax
 from flax.training.train_state import TrainState
 
-from one_policy_to_run_them_all.mjx.robot_spec import load_spec
+import signal
+import sys
+
+from one_policy_to_run_them_all.mjx.robot_spec import load_spec, TRAIN_16, EVAL_4
 from one_policy_to_run_them_all.mjx.mjx_env import MJXRobotEnv
 
 PPO_DIR = Path(__file__).resolve().parents[1] / "algorithms" / "uni_ppo" / "ppo"
@@ -46,7 +49,11 @@ Critic = _load("urma_critic", PPO_DIR / "critic.py").Critic
 
 def parse():
     p = argparse.ArgumentParser()
-    p.add_argument("--robots", default="unitree_go1,unitree_h1,hexapod")
+    p.add_argument("--robots", default=",".join(TRAIN_16))
+    p.add_argument("--eval_robots", default=",".join(EVAL_4), help="unseen robots: evaluated only, never trained on ('' = none)")
+    p.add_argument("--eval_every", type=int, default=0, help="evaluate every N iterations (0 = every 204800/(steps per iter) like CPU uni_ppo, rounded up)")
+    p.add_argument("--eval_envs", type=int, default=64, help="envs per eval robot")
+    p.add_argument("--max_wall_s", type=float, default=0, help=">0: checkpoint and exit(3) after this many seconds (chained jobs)")
     p.add_argument("--nr_envs", type=int, default=4096, help="per robot type")
     p.add_argument("--nr_steps", type=int, default=42)
     p.add_argument("--nr_minibatches", type=int, default=16)
@@ -81,7 +88,11 @@ def main():
     R = len(robots)
     N, T = a.nr_envs, a.nr_steps
     envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
-                        nr_envs_per_type=N, model_variant=a.model_variant) for r in robots]
+                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env) for r in robots]
+    eval_robots = [r for r in a.eval_robots.split(",") if r]
+    eval_envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
+                             nr_envs_per_type=a.eval_envs, model_variant=a.model_variant, eval_mode=True,
+                             contacts_per_env=a.contacts_per_env) for r in eval_robots]
     batch_per_type = N * T
     assert batch_per_type % a.nr_minibatches == 0
     mb = batch_per_type // a.nr_minibatches
@@ -121,6 +132,9 @@ def main():
         cstate = cstate.replace(params=ck["cparams"], opt_state=ck["copt"], step=jnp.array(ck["cstep"], jnp.int32))
         start_iter = ck["iter"]
         key = ck["key"]
+        # env counters drive the reward curriculum and the first-step command sample: continue them
+        # (DR / physics state restart from a fresh reset; DR is resampled with prob 0.002 per step anyway)
+        states = [s.replace(steps_done=jnp.full_like(s.steps_done, start_iter * T)) for s in states]
         print(f"resumed from iter {start_iter}", flush=True)
 
     def pol(params, o):
@@ -226,6 +240,48 @@ def main():
             }
         return pstate, cstate, states, key, met, stats
 
+    horizon = max([e.horizon for e in eval_envs] or [1])
+    eval_every = a.eval_every or -(-204800 // steps_per_iter)
+
+    @jax.jit
+    def evaluate(pparams, key):
+        """CPU uni_ppo evaluate_callback: eval robots (env.eval -> curriculum 1), stochastic policy
+        actions, statistics of the first finished episode of every env within one horizon."""
+        stats = {}
+        for r, e in zip(eval_robots, eval_envs):
+            key, kr, kl = jax.random.split(key, 3)
+            s0 = e.batch_reset(kr, a.eval_envs)
+
+            def body(c, _):
+                s, k, seen, ret, ln, trk = c
+                k, ka = jax.random.split(k)
+                mean, logstd = pol(pparams, s.obs)
+                act = mean + jnp.exp(logstd) * jax.random.normal(ka, mean.shape)
+                s, info = e.batch_step(s, act)
+                first = info["done"] & ~seen
+                ret = jnp.where(first, info["episode_return"], ret)
+                ln = jnp.where(first, info["episode_length"], ln)
+                trk = jnp.where(first, info["eps_track_perf_perc"], trk)
+                return (s, k, seen | info["done"], ret, ln, trk), None
+            z = jnp.zeros(a.eval_envs)
+            (s, _, seen, ret, ln, trk), _ = jax.lax.scan(body, (s0, kl, jnp.zeros(a.eval_envs, bool), z, z, z), None, length=e.horizon)
+            cnt = jnp.maximum(seen.sum(), 1)
+            stats[r] = {"ep_return": (ret * seen).sum() / cnt, "ep_length": (ln * seen).sum() / cnt,
+                        "eps_track_perf": (trk * seen).sum() / cnt, "episodes": seen.sum()}
+        return stats
+
+    stop = {"flag": False}
+    signal.signal(signal.SIGUSR1, lambda *_: stop.update(flag=True))  # Slurm --signal=USR1@<s>: checkpoint + exit(3)
+
+    def save_ckpt(it_done):
+        tmp = out / "checkpoint.pkl.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"pparams": jax.device_get(pstate.params), "popt": jax.device_get(pstate.opt_state),
+                         "pstep": int(pstate.step), "cparams": jax.device_get(cstate.params),
+                         "copt": jax.device_get(cstate.opt_state), "cstep": int(cstate.step),
+                         "iter": it_done, "key": jax.device_get(key), "args": vars(a)}, f)
+        os.replace(tmp, ckpt)
+
     if a.debug_finite:
         st_, k_, traj_ = jax.jit(rollout)(pstate, cstate, states, key)
         for r, tr in zip(robots, traj_):
@@ -251,17 +307,23 @@ def main():
                "sps": round(steps_per_iter / dt), "iter_s": round(dt, 2), "wall_s": round(time.time() - t0, 1),
                **{k: float(v) for k, v in met.items()},
                **{f"{r}/{k}": float(v) for r, s in stats.items() for k, v in s.items()}}
+        if eval_envs and a.bench_iters == 0 and (it + 1) % eval_every == 0:
+            te = time.time()
+            key, ke = jax.random.split(key)
+            ev = jax.device_get(evaluate(pstate.params, ke))
+            rec.update({f"eval/{r}/{k}": float(v) for r, s_ in ev.items() for k, v in s_.items()})
+            rec["eval_s"] = round(time.time() - te, 1)
         log.write(json.dumps(rec) + "\n"); log.flush()
         if (it + 1) % 5 == 0 or it == start_iter + 1:
             print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in rec.items()}), flush=True)
-        if a.bench_iters == 0 and ((it + 1) % a.save_every == 0 or it + 1 == nr_iters):
-            tmp = out / "checkpoint.pkl.tmp"
-            with open(tmp, "wb") as f:
-                pickle.dump({"pparams": jax.device_get(pstate.params), "popt": jax.device_get(pstate.opt_state),
-                             "pstep": int(pstate.step), "cparams": jax.device_get(cstate.params),
-                             "copt": jax.device_get(cstate.opt_state), "cstep": int(cstate.step),
-                             "iter": it + 1, "key": jax.device_get(key)}, f)
-            os.replace(tmp, ckpt)
+        timeout = a.max_wall_s > 0 and time.time() - t0 > a.max_wall_s
+        if a.bench_iters == 0 and ((it + 1) % a.save_every == 0 or it + 1 == nr_iters or stop["flag"] or timeout):
+            save_ckpt(it + 1)
+        if a.bench_iters == 0 and (stop["flag"] or timeout) and it + 1 < nr_iters:
+            print(f"CHECKPOINTED at iter {it + 1}/{nr_iters}; exiting for the next chained job", flush=True)
+            sys.exit(3)
+    if a.bench_iters == 0:
+        (out / "DONE").write_text(str(nr_iters))
     print("DONE", flush=True)
 
 
