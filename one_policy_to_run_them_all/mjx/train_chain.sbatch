@@ -12,7 +12,10 @@
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/network/scratch/c/charlie.gauthier/urma_context/jobs/%x-%j.out
 export XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 MUJOCO_GL=egl
-export PYTHONPATH=/network/scratch/c/charlie.gauthier/urma_context/urma-mjx-wt
+# URMA_MJX_CODE: code tree to run (default: the mjx-spike worktree). For real runs point it at a frozen
+# checkout so later edits never change a running chain; it is exported to every resubmitted job.
+export URMA_MJX_CODE=${URMA_MJX_CODE:-/network/scratch/c/charlie.gauthier/urma_context/urma-mjx-wt}
+export PYTHONPATH=$URMA_MJX_CODE
 export WARP_CACHE_PATH=/network/scratch/c/charlie.gauthier/urma_context/mjx/warp_cache JAX_COMPILATION_CACHE_DIR=/network/scratch/c/charlie.gauthier/urma_context/mjx/jax_cache
 export XDG_CACHE_HOME=/network/scratch/c/charlie.gauthier/urma_context/mjx/xdg_cache
 OUT=""; prev=""
@@ -24,11 +27,11 @@ nvidia-smi -L
 mkdir -p "$OUT"
 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits -l 30 > "$OUT/gpu-${SLURM_JOB_ID}.csv" &
 /network/scratch/c/charlie.gauthier/urma_context/venv_mjx/bin/python \
-  /network/scratch/c/charlie.gauthier/urma_context/urma-mjx-wt/one_policy_to_run_them_all/mjx/train_mjx.py \
+  $URMA_MJX_CODE/one_policy_to_run_them_all/mjx/train_mjx.py \
   --max_wall_s "$MAX_WALL_S" "$@"
 rc=$?
 echo "EXIT $rc"
 if [ $rc -eq 3 ] && [ ! -e "$OUT/STOP" ] && [ ! -e "$OUT/DONE" ]; then
   sbatch --job-name="$SLURM_JOB_NAME" --partition="$SLURM_JOB_PARTITION" --time="$(squeue -h -j $SLURM_JOB_ID -o %l)" \
-    /network/scratch/c/charlie.gauthier/urma_context/urma-mjx-wt/one_policy_to_run_them_all/mjx/train_chain.sbatch "$@"
+    --export=ALL,URMA_MJX_CODE=$URMA_MJX_CODE $URMA_MJX_CODE/one_policy_to_run_them_all/mjx/train_chain.sbatch "$@"
 fi
