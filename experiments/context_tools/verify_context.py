@@ -6,7 +6,7 @@ For every robot x arm (default pose and 3 DR samples, seed 0):
   * widths: equal within an arm family across all robots; foot width 10 everywhere
   * K / D / LAT / G column sets disjoint; switched-off blocks exactly zero
   * empty: joint AND foot tokens all zero (G copies zeroed too); other arms keep G
-  * vme / vmestar / matme: only latent + D (+ G) columns non-zero; latent equals the file's latent
+  * latent arms (every <latent_dir>/<arm>/ dir: vme, vmestar, matme, vme_sa, vmestar_sa, ...): only latent + D (+ G) columns non-zero; latent equals the file's latent
   * dk restricted to URMA's fields == stock URMA values (bitwise), G == stock G,
     D link fields recomputed after DR (seen values), and urma arm == stock
   * no two arms identical for a robot
@@ -20,7 +20,8 @@ from one_policy_to_run_them_all.context import limb_context as lc
 stock = np.load(sys.argv[1])
 latent_dir = sys.argv[2]
 out = sys.argv[3] if len(sys.argv) > 3 else None
-ARMS = lc.ALL_ARMS
+ARMS = ("urma",) + lc.NON_LATENT_ARMS + tuple(sorted(p.name for p in __import__("pathlib").Path(latent_dir).iterdir() if p.is_dir() and lc.is_latent_arm(p.name)))
+LAT_ARMS = [a for a in ARMS if lc.is_latent_arm(a)]
 dump = {}
 widths = {}
 stock_layout = lc.joint_layout("urma")
@@ -46,7 +47,7 @@ def print_table(robot, env, mats):
         on = " ".join(f"{'x' if block in lc.ARM_BLOCKS_ON[a] else '.':>7s}" for a in ("dk", "k", "d", "empty"))
         vals = np.array2string(mats["dk"][0][0, s:e], precision=3, suppress_small=True, max_line_width=200)
         print(f"{block:5s} {f:16s} {s:3d}:{e:<5d} {on}   {vals}")
-    for la in lc.LATENT_ARMS:
+    for la in LAT_ARMS:
         ll = lc.joint_layout(la, mats[la][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH)
         print(f"{la}: " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in ll.columns if b != "D"))
     print(f"foot token (all arms): " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in lc.FOOT_LAYOUT.columns)
@@ -92,7 +93,7 @@ for robot in ALL_ROBOTS:
         if arm == "urma":
             continue
         env, per_sample = envs[arm]
-        latent_dim = per_sample[0][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if arm in lc.LATENT_ARMS else 0
+        latent_dim = per_sample[0][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
         lay = lc.joint_layout(arm, latent_dim)
         blocks = {b: set(lay.block_columns(b).tolist()) for b in ("K", "D", "LAT", "G")}
         allc = [c for b in blocks.values() for c in b]
@@ -115,7 +116,7 @@ for robot in ALL_ROBOTS:
         if arm == "empty":
             for J, F in per_sample:
                 assert not np.any(J) and not np.any(F), (robot, "empty tokens not all zero")
-        if arm in lc.LATENT_ARMS:
+        if lc.is_latent_arm(arm):
             lat = lc.load_latents(latent_dir, arm, lc.robot_dir_name(env), env.model)
             want = np.stack([lat[b] for b in env._limb_context_static["body_names"]])
             assert np.array_equal(per_sample[0][0][:, lay.block_columns("LAT")], want), (robot, arm, "latent mismatch")
@@ -125,7 +126,7 @@ for robot in ALL_ROBOTS:
     for arm in ARMS:
         if arm in ("urma", "empty"):
             continue
-        lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if arm in lc.LATENT_ARMS else 0
+        lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
         assert np.array_equal(mats[arm][0][:, lc.joint_layout(arm, lat_dim).block_columns("G")], g_stock), (robot, arm, "G differs")
     # no two arms identical
     for i, a in enumerate(ARMS):
@@ -142,7 +143,7 @@ for arm, w in widths.items():
     assert len(w) == 1, (arm, "width differs across robots", w)
 fam = {widths[a].copy().pop()[0] for a in lc.NON_LATENT_ARMS}
 assert len(fam) == 1, ("non-latent family widths differ", fam)
-fam = {widths[a].copy().pop()[0] for a in lc.LATENT_ARMS}
+fam = {widths[a].copy().pop()[0] for a in LAT_ARMS}
 assert len(fam) == 1, ("latent family widths differ", fam)
 print("\nALL CHECKS PASSED; joint widths:", {a: widths[a].copy().pop()[0] for a in ARMS})
 if out:

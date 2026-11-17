@@ -9,7 +9,7 @@ from one_policy_to_run_them_all.context.limb_context import robot_dir_name
 
 out_root = Path(sys.argv[1]); dim = int(sys.argv[2]) if len(sys.argv) > 2 else 16
 assert "dummy" in out_root.as_posix(), "dummy latents must go to a path containing 'dummy'"
-for arm, salt in (("vme", 1), ("matme", 2), ("vmestar", 3)):
+for arm, salt in (("vme", 1), ("matme", 2), ("vmestar", 3), ("vme_sa", 4), ("vmestar_sa", 5)):
     (out_root / arm).mkdir(parents=True, exist_ok=True)
     for name in ALL_ROBOTS:
         env = build_env(name)
