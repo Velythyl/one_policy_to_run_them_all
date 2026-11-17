@@ -7,7 +7,7 @@ For every robot x arm (default pose and 3 DR samples, seed 0):
   * K / D / LAT / G column sets disjoint; switched-off blocks exactly zero
   * empty: joint AND foot tokens all zero (G copies zeroed too); other arms keep G
   * latent arms (every <latent_dir>/<arm>/ dir: vme, vmestar, matme, vme_sa, vmestar_sa, ...): only latent + D (+ G) columns non-zero; latent equals the file's latent
-  * dk restricted to URMA's fields == stock URMA values (bitwise), G == stock G,
+  * urma arm == stock (bitwise), dk/k/d/latent G == stock G, feet == stock,
     D link fields recomputed after DR (seen values), and urma arm == stock
   * no two arms identical for a robot
 Prints the field tables for unitree_a1 and atlas.
@@ -48,7 +48,7 @@ def print_table(robot, env, mats):
         vals = np.array2string(mats["dk"][0][0, s:e], precision=3, suppress_small=True, max_line_width=200)
         print(f"{block:5s} {f:16s} {s:3d}:{e:<5d} {on}   {vals}")
     for la in LAT_ARMS:
-        ll = lc.joint_layout(la, mats[la][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH)
+        ll = lc.joint_layout(la, mats[la][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH)
         print(f"{la}: " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in ll.columns if b != "D"))
     print(f"foot token (all arms): " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in lc.FOOT_LAYOUT.columns)
           + "; foot_pos zeroed in arms without K")
@@ -79,23 +79,24 @@ for robot in ALL_ROBOTS:
         Ju, Fu = envs["urma"][1][s_i]
         assert np.array_equal(Ju, Js) and np.array_equal(Fu, Fs), (robot, "urma != stock", s_i)
         Jdk, Fdk = envs["dk"][1][s_i]
+        assert np.array_equal(Fdk, Fs), (robot, s_i, "dk feet != stock")
         dk_lay = lc.joint_layout("dk")
         for _, f, s, e in stock_layout.columns:
-            assert np.array_equal(Jdk[:, dk_lay.field_slice(f)], Js[:, s:e]), (robot, s_i, f, "dk != stock")
-        assert np.array_equal(Fdk, Fs), (robot, s_i, "dk feet != stock")
+            if f in dict(lc.G_FIELDS):
+                assert np.array_equal(Jdk[:, dk_lay.field_slice(f)], Js[:, s:e]), (robot, s_i, f, "dk G != stock")
 
     # D recomputed under DR: torque limit (always resampled) must change across samples
     dk_lay = lc.joint_layout("dk")
-    tl = [envs["dk"][1][s][0][:, dk_lay.field_slice("torque_limit")] for s in range(4)]
+    tl = [envs["dk"][1][s][0][:, dk_lay.field_slice("gear")] for s in range(4)]
     assert not np.array_equal(tl[0], tl[1]), (robot, "D not recomputed after DR")
 
     for arm in ARMS:
         if arm == "urma":
             continue
         env, per_sample = envs[arm]
-        latent_dim = per_sample[0][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
+        latent_dim = per_sample[0][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
         lay = lc.joint_layout(arm, latent_dim)
-        blocks = {b: set(lay.block_columns(b).tolist()) for b in ("K", "D", "LAT", "G")}
+        blocks = {b: set(lay.block_columns(b).tolist()) for b in ("K", "D", "P", "LAT", "G")}
         allc = [c for b in blocks.values() for c in b]
         assert len(allc) == len(set(allc)) == lay.width, (robot, arm, "blocks not disjoint / not covering")
         for J, F in per_sample:
@@ -126,7 +127,7 @@ for robot in ALL_ROBOTS:
     for arm in ARMS:
         if arm in ("urma", "empty"):
             continue
-        lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
+        lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
         assert np.array_equal(mats[arm][0][:, lc.joint_layout(arm, lat_dim).block_columns("G")], g_stock), (robot, arm, "G differs")
     # no two arms identical
     for i, a in enumerate(ARMS):
