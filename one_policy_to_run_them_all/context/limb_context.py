@@ -282,10 +282,11 @@ def body_capsule_points(m, body):
     return np.concatenate(pts) if pts else np.zeros((0, 3))
 
 
-def fit_capsule(pts, radius_pct=95.0):
+def fit_capsule(pts):
     """Capsule (centre, unit axis, radius, half_length) fitted to surface points (body frame).
-    Axis = principal axis (PCA); centre = middle of the point extents in the PCA frame; radius = the
-    `radius_pct` percentile of the distance to the axis; half_length = max(0, half axial extent - radius).
+    Axis = principal axis (PCA); centre = middle of the point extents in the PCA frame. The capsule ENCLOSES
+    every point: radius = max distance to the axis; half_length = smallest value >= 0 with every point inside,
+    i.e. max_i(|t_i| - sqrt(max(radius^2 - perp_i^2, 0))), t_i = axial coordinate from the centre.
     Axis sign: pointing away from the body origin (axis . centre >= 0), else largest component > 0.
     Returns None without points."""
     if len(pts) == 0:
@@ -298,9 +299,10 @@ def fit_capsule(pts, radius_pct=95.0):
     mid = (lo + hi) / 2
     centre = mean + U @ mid
     a = U[:, 0]
+    t = (q - mid)[:, 0]
     perp = np.linalg.norm((q - mid)[:, 1:], axis=1)
-    radius = float(np.percentile(perp, radius_pct))
-    half_length = float(max(0.0, (hi[0] - lo[0]) / 2 - radius))
+    radius = float(perp.max())
+    half_length = float(max(0.0, (np.abs(t) - np.sqrt(np.maximum(radius ** 2 - perp ** 2, 0.0))).max()))
     if np.linalg.norm(centre) > 1e-6 and abs(a @ centre) > 1e-9:
         a = a * np.sign(a @ centre)
     elif a[np.argmax(np.abs(a))] < 0:
