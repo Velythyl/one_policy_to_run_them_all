@@ -65,7 +65,56 @@ def configure_warp_ffi():
     return mode, cache
 
 
+def patch_warp_external_streams():
+    """Warp's FFI callback wraps XLA's stream in a fresh non-owning wp.Stream on every call; the
+    wrapper's __del__ unregisters the stream handle from Warp's global stream table. A stale wrapper
+    for the same handle that is freed late (cyclic GC, evicted capture) therefore unregisters the
+    stream in the middle of a later call -> "Warp error: unknown stream" in capture_begin (seen in the
+    first jit_evaluate of a 16-robot run). Reference-count external registrations per handle, so the
+    handle is unregistered only when its last wrapper dies."""
+    import threading
+    from warp._src import context as wctx
+    S = wctx.Stream
+    if getattr(S, "_urma_refcount_patch", False):
+        return
+    refs, lock = {}, threading.Lock()
+    orig_init, orig_del = S.__init__, S.__del__
+
+    def __init__(self, device=None, priority=0, **kwargs):
+        if "cuda_stream" not in kwargs or not kwargs["cuda_stream"]:
+            return orig_init(self, device, priority, **kwargs)
+        self._cached_event = None
+        device = wctx.runtime.get_device(device)
+        if not device.is_cuda:
+            raise RuntimeError(f"Device {device} is not a CUDA device")
+        self.device, self.cuda_stream, self._is_blocking = device, kwargs["cuda_stream"], None
+        key = (device.ordinal, int(self.cuda_stream))
+        with lock:
+            if refs.get(key, 0) == 0:
+                device.runtime.core.wp_cuda_stream_register(device.context, self.cuda_stream)
+            refs[key] = refs.get(key, 0) + 1
+        self._urma_key = key
+
+    def __del__(self):
+        key = getattr(self, "_urma_key", None)
+        if key is None:
+            return orig_del(self)
+        try:
+            with lock:
+                refs[key] -= 1
+                last = refs[key] == 0
+                if last:
+                    del refs[key]
+                    wctx.runtime.core.wp_cuda_stream_unregister(self.device.context, self.cuda_stream)
+        except (TypeError, AttributeError, KeyError):
+            pass
+
+    S.__init__, S.__del__, S._urma_refcount_patch = __init__, __del__, True
+
+
 WARP_FFI_CONFIG = configure_warp_ffi()
+if __import__("os").environ.get("URMA_STREAM_PATCH", "1") == "1":
+    patch_warp_external_streams()
 from one_policy_to_run_them_all.mjx.robot_spec import RobotSpec
 
 
@@ -193,6 +242,7 @@ class MJXRobotEnv:
     eval_mode: bool = False  # CPU env.eval: curriculum coefficient 1.0
     contacts_per_env: int = 64
     solimp_dmax_clamp: float = 0.0  # >0: cap geom solimp dmax (see __post_init__)
+    friction_tangential_floor: float = 0.0  # >0: DR tangential friction sampled in [max(min, floor), max]
 
     def __post_init__(self):
         sp, c = self.spec, self.spec.cfg
@@ -389,7 +439,9 @@ class MJXRobotEnv:
         # mujoco_model_functions/default.py
         it = u(0.0, 1.0)
         lerp = lambda lo, hi, t: lo + (hi - lo) * t
-        tang = lerp(M["friction_tangential_min"], M["friction_tangential_max"], it)
+        # friction_tangential_floor > 0 (GPU deviation, off by default): sample the tangential friction in
+        # [max(min, floor), max]. Warp (float32, pyramidal cone, impratio 100) diverges for mu < ~0.05.
+        tang = lerp(max(M["friction_tangential_min"], self.friction_tangential_floor), M["friction_tangential_max"], it)
         if self.model_struct["friction_mode"] == "ground_feet":
             fg = jnp.stack([tang, lerp(M["friction_torsional_ground_min"], M["friction_torsional_ground_max"], it),
                             lerp(M["friction_rolling_ground_min"], M["friction_rolling_ground_max"], it)])

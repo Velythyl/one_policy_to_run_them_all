@@ -46,6 +46,43 @@ def fwd(dr1, d):
     return jax.vmap(mjx.forward, in_axes=(0, 0))(models, d)
 
 
+@partial(jax.jit, static_argnums=2)
+def phys_nominal(dr1, d, field):
+    """phys() with one DR'd model field reset to the nominal (un-randomised) model value."""
+    models = jax.vmap(env.model_for)(dr1)
+    if field == "gravity":
+        models = models.replace(opt=models.opt.replace(gravity=jnp.broadcast_to(env.mx.opt.gravity, models.opt.gravity.shape)))
+    else:
+        nom = getattr(env.mx, field)
+        models = models.replace(**{field: jnp.broadcast_to(nom, getattr(models, field).shape)})
+    stepper = jax.vmap(mjx.step, in_axes=(0, 0))
+    d = jax.lax.fori_loop(0, env.nsub, lambda i, dd: stepper(models, dd), d)
+    return jnp.max(jnp.abs(d.qvel)), jnp.all(jnp.isfinite(d.qvel))
+
+
+@partial(jax.jit, static_argnums=(2, 3))
+def phys_fric(dr1, d, col, floor):
+    """phys() with geom_friction column `col` (0 tangential, 1 torsional, 2 rolling) at the nominal
+    model value (floor=None) or floored at `floor`."""
+    models = jax.vmap(env.model_for)(dr1)
+    gf = models.geom_friction
+    if floor is None:
+        gf = gf.at[..., col].set(jnp.broadcast_to(env.mx.geom_friction[:, col], gf[..., col].shape))
+    else:
+        gf = gf.at[..., col].set(jnp.maximum(gf[..., col], floor))
+    models = models.replace(geom_friction=gf)
+    stepper = jax.vmap(mjx.step, in_axes=(0, 0))
+    d = jax.lax.fori_loop(0, env.nsub, lambda i, dd: stepper(models, dd), d)
+    return jnp.max(jnp.abs(d.qvel)), jnp.all(jnp.isfinite(d.qvel))
+
+
+FRIC_TESTS = [(0, None), (1, None), (2, None), (0, 0.1), (0, 0.2), (0, 0.3), (1, 1e-3), (1, 3e-3), (2, 1e-4), (2, 1e-3)]
+
+
+DR_FIELDS = ("body_mass", "body_inertia", "body_ipos", "geom_size", "geom_friction", "geom_solref", "actuator_ctrlrange",
+             "jnt_range", "dof_damping", "dof_armature", "dof_frictionloss", "jnt_stiffness", "gravity")
+
+
 def per_world_paths(d):
     out = []
     for path, x in jax.tree_util.tree_leaves_with_path(d):
@@ -62,12 +99,17 @@ def build(pre_d, i, ctrl_i, take_from_pre):
                                qacc_warmstart=pre_d.qacc_warmstart[i:i + 1])
     base = fwd(dr1, base)
 
-    def leaf(path, b, p):
-        name = tree_path_to_attr_str(path)
-        if name in take_from_pre and hasattr(p, "ndim") and p.ndim > 0 and p.shape[0] == N:
-            return p[i:i + 1]
-        return b
-    d = jax.tree_util.tree_map_with_path(leaf, base, pre_d)
+    pre_leaves = {tree_path_to_attr_str(pth): x for pth, x in jax.tree_util.tree_leaves_with_path(pre_d)}
+    bl, tdef = jax.tree_util.tree_flatten_with_path(base)
+    new = []
+    for pth, b in bl:
+        name = tree_path_to_attr_str(pth)
+        p = pre_leaves.get(name)
+        if name in take_from_pre and p is not None and p.ndim > 0 and p.shape[0] == N and p.shape[1:] == b.shape[1:]:
+            new.append(p[i:i + 1])
+        else:
+            new.append(b)
+    d = jax.tree_util.tree_unflatten(tdef, new)
     d = d.replace(ctrl=jnp.asarray(ctrl_i)[None])
     return dr1, d
 
@@ -94,11 +136,28 @@ for t in range(S):
         r = {"t": t, "world": i}
         r["full"] = bad(*build(s_pre.data, i, ctrl[i], set(fields)))
         r["fresh"] = bad(*build(s_pre.data, i, ctrl[i], set()))
+        if r["fresh"][0]:
+            dr1, dfr = build(s_pre.data, i, ctrl[i], set())
+            fixes = {}
+            for f in DR_FIELDS:
+                mv, fin = phys_nominal(dr1, dfr, f)
+                fixes[f] = bool(fin & (mv < 1e4))
+            r["fixed_by_nominal"] = [f for f, ok in fixes.items() if ok]
+            fr = {}
+            for col, fl in FRIC_TESTS:
+                mv, fin = phys_fric(dr1, dfr, col, fl)
+                fr[f"col{col}_{'nominal' if fl is None else fl}"] = bool(fin & (mv < 1e4))
+            r["friction_fix"] = fr
+            r["geom_friction_used"] = np.round(np.asarray(jax.vmap(env.model_for)(dr1).geom_friction[0]), 5)[
+                np.unique(np.r_[0, np.asarray(env.feet_fric).ravel()]) if hasattr(env, "feet_fric") else slice(0, 3)].tolist()
+            r["dr_unused"] = {k: np.round(np.asarray(v[i]), 4).tolist() for k, v in vars(s_pre.dr).items()
+                       if k in ("solref", "friction_feet", "friction_ground", "damping", "armature", "frictionloss",
+                                "stiffness", "body_mass_trunk", "foot_size", "gravity_z")} if hasattr(s_pre.dr, "__dict__") else {}
         if r["full"][0] and not r["fresh"][0]:
             # one field at a time from the batch (on top of fresh) -> which stale field reproduces it
             r["culprits"] = [f for f in fields if f not in ("qpos", "qvel", "ctrl", "qacc_warmstart")
                              and bad(*build(s_pre.data, i, ctrl[i], {f}))[0]]
-        print(json.dumps(r), flush=True)
+        r.pop("dr_unused", None); print(json.dumps(r), flush=True)
         results.append(r)
     if len(results) >= K:
         break

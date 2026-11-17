@@ -74,6 +74,9 @@ def parse():
     p.add_argument("--contacts_per_env", type=int, default=64)
     p.add_argument("--solimp_dmax_clamp", type=float, default=0.99,
                    help="cap geom solimp dmax (float32 Warp blows up at impedance ~1: go1/anymal/badger feet); 0 = off")
+    p.add_argument("--friction_tangential_floor", type=float, default=0.0,
+                   help="GPU deviation (off by default): DR tangential friction sampled in [max(min, floor), max]; "
+                        "Warp diverges for mu < ~0.05 (upstream min 0.001 for 13 robots)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     p.add_argument("--save_every", type=int, default=50)
@@ -111,11 +114,11 @@ def main():
     R = len(robots)
     N, T = a.nr_envs, a.nr_steps
     envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
-                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp) for r in robots]
+                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor) for r in robots]
     eval_robots = [r for r in a.eval_robots.split(",") if r]
     eval_envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
                              nr_envs_per_type=a.eval_envs, model_variant=a.model_variant, eval_mode=True,
-                             contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp) for r in eval_robots]
+                             contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor) for r in eval_robots]
     batch_per_type = N * T
     assert batch_per_type % a.nr_minibatches == 0
     mb = batch_per_type // a.nr_minibatches
