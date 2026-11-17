@@ -32,6 +32,7 @@ import sys
 
 from one_policy_to_run_them_all.mjx.robot_spec import load_spec, TRAIN_16, EVAL_4
 from one_policy_to_run_them_all.mjx.mjx_env import MJXRobotEnv, WARP_FFI_CONFIG
+from one_policy_to_run_them_all.mjx.wandb_logger import WandbLogger, build_config, REWARD_TERMS
 
 PPO_DIR = Path(__file__).resolve().parents[1] / "algorithms" / "uni_ppo" / "ppo"
 
@@ -138,6 +139,9 @@ def main():
     print(json.dumps({"recipe_deviations_gpu": deviations}), flush=True)
     cfg = {"args": vars(a), "recipe_deviations_gpu": deviations, "warp_ffi": list(WARP_FFI_CONFIG)}
     (out / f"config-{os.environ.get('SLURM_JOB_ID', 'local')}.json").write_text(json.dumps(cfg, indent=1))
+    wcfg = build_config(a, robots, eval_robots, deviations, WARP_FFI_CONFIG, jax.devices()[0].device_kind, steps_per_iter,
+                        nr_iters, Path(__file__).resolve().parents[2], out.name)
+    wlog = WandbLogger(out, wcfg, out.name, robots, eval_robots) if a.bench_iters == 0 and not a.debug_finite else None
 
     policy = Policy(1.0, 1.0, 0.015, 1e-8, 10.0, 1e-8, 2.0)
     critic = Critic(1.0, 0.015, 1e-8)
@@ -179,10 +183,10 @@ def main():
     def val(params, o):
         return critic.apply(params, o["jd"], o["js"], o["fd"], o["fs"], o["gc"]).squeeze(-1)
 
-    def rollout(pstate, cstate, states, key):
+    def rollout(pstate, cstate, states, key, racc):
         def body(carry, _):
-            states, key = carry
-            new_states, trans = [], []
+            states, key, racc = carry
+            new_states, trans, new_racc = [], [], []
             for i, e in enumerate(envs):
                 key, k = jax.random.split(key)
                 o = states[i].obs
@@ -194,15 +198,19 @@ def main():
                 s2, info = e.batch_step(states[i], act)
                 nv = val(cstate.params, info["final_obs"])
                 new_states.append(s2)
+                # logging only: per-episode sums of each reward term (accumulated across iterations in racc)
+                acc = racc[i] + info["reward_terms"]
+                dn_ = info["done"][:, None]
+                new_racc.append(jnp.where(dn_, 0.0, acc))
                 trans.append(dict(obs=o, act=act, logp=logp, val=v, next_val=nv, rew=info["reward"],
                                   term=info["terminated"].astype(jnp.float32), done=info["done"],
                                   ep_ret=info["episode_return"], ep_len=info["episode_length"],
                                   eps_track=info["eps_track_perf_perc"], track_err=info["track_err_sq"],
-                                  unstable=info["sim_unstable"].astype(jnp.float32),
+                                  unstable=info["sim_unstable"].astype(jnp.float32), ep_terms=jnp.where(dn_, acc, 0.0),
                                   **{k: info[k].astype(jnp.float32) for k in info if k.startswith("ovf_") or k in ("nacon_frac", "nefc_max")}))
-            return (new_states, key), trans
-        (states, key), traj = jax.lax.scan(body, (states, key), None, length=T)
-        return states, key, traj
+            return (new_states, key, new_racc), trans
+        (states, key, racc), traj = jax.lax.scan(body, (states, key, racc), None, length=T)
+        return states, key, traj, racc
 
     def gae(tr):
         delta = tr["rew"] + a.gamma * tr["next_val"] * (1.0 - tr["term"]) - tr["val"]
@@ -260,9 +268,9 @@ def main():
 
     # Donating the carried state keeps XLA's buffer addresses stationary across iterations, so Warp's
     # address-keyed CUDA graphs (GraphMode.WARP) are re-used instead of re-captured every iteration.
-    @partial(jax.jit, donate_argnums=(0, 1, 2) if os.environ.get("URMA_DONATE", "1") == "1" else ())
-    def iteration(pstate, cstate, states, key):
-        states, key, traj = rollout(pstate, cstate, states, key)
+    @partial(jax.jit, donate_argnums=(0, 1, 2, 4) if os.environ.get("URMA_DONATE", "1") == "1" else ())
+    def iteration(pstate, cstate, states, key, racc):
+        states, key, traj, racc = rollout(pstate, cstate, states, key, racc)
         pstate, cstate, met, key = update(pstate, cstate, traj, key)
         stats = {}
         for r, tr in zip(robots, traj):
@@ -278,8 +286,10 @@ def main():
                 "sim_unstable": tr["unstable"].sum(),
                 **{k: tr[k][-1].sum() for k in tr if k.startswith("ovf_")},  # worlds ever flagged (sticky)
                 **{k: tr[k].max() for k in ("nacon_frac", "nefc_max") if k in tr},
+                **{f"term_{t}": jnp.where(cnt > 0, tr["ep_terms"][..., j].sum() / jnp.maximum(cnt, 1), jnp.nan)
+                   for j, t in enumerate(REWARD_TERMS)},
             }
-        return pstate, cstate, states, key, met, stats
+        return pstate, cstate, states, key, met, stats, racc
 
     horizon = max([e.horizon for e in eval_envs] or [1])
     eval_every = a.eval_every or -(-17233920 // steps_per_iter)
@@ -323,8 +333,9 @@ def main():
                          "iter": it_done, "key": jax.device_get(key), "args": vars(a)}, f)
         os.replace(tmp, ckpt)
 
+    racc = [jnp.zeros((N, len(REWARD_TERMS)), jnp.float32) for _ in robots]  # fresh episodes after (re)start
     if a.debug_finite:
-        st_, k_, traj_ = jax.jit(rollout)(pstate, cstate, states, key)
+        st_, k_, traj_, _ = jax.jit(rollout)(pstate, cstate, states, key, racc)
         for r, tr in zip(robots, traj_):
             for path, x in jax.tree_util.tree_leaves_with_path(tr):
                 if jnp.issubdtype(x.dtype, jnp.floating):
@@ -339,7 +350,7 @@ def main():
     n_run = a.bench_iters if a.bench_iters > 0 else nr_iters
     for it in range(start_iter, n_run):
         ti = time.time()
-        pstate, cstate, states, key, met, stats = iteration(pstate, cstate, states, key)
+        pstate, cstate, states, key, met, stats, racc = iteration(pstate, cstate, states, key, racc)
         jax.block_until_ready(met)
         dt = time.time() - ti
         if it == start_iter:
@@ -356,6 +367,8 @@ def main():
             rec["eval_s"] = round(time.time() - te, 1)
         rec.update(gpu_mem_diag())
         log.write(json.dumps(rec) + "\n"); log.flush()
+        if wlog is not None:
+            wlog.log(rec)
         if (it + 1) % 5 == 0 or it == start_iter + 1:
             print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in rec.items()}), flush=True)
         timeout = a.max_wall_s > 0 and time.time() - t0 > a.max_wall_s
@@ -363,9 +376,13 @@ def main():
             save_ckpt(it + 1)
         if a.bench_iters == 0 and (stop["flag"] or timeout) and it + 1 < nr_iters:
             print(f"CHECKPOINTED at iter {it + 1}/{nr_iters}; exiting for the next chained job", flush=True)
+            if wlog is not None:
+                wlog.finish(0)
             sys.exit(3)
     if a.bench_iters == 0:
         (out / "DONE").write_text(str(nr_iters))
+    if wlog is not None:
+        wlog.finish(0)
     print("DONE", flush=True)
 
 

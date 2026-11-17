@@ -7,6 +7,10 @@
 # GPU recipe deviations (train_mjx.py defaults, logged as "recipe_deviations_gpu" + <out>/config-<job>.json):
 #   --solimp_dmax_clamp 0.99, --physics_overrides '{"impratio_adapt_mu0": 0.3}' (per-world impratio lowered only for
 #   DR tangential mu < 0.3; model identical to upstream for mu >= 0.3); --friction_tangential_floor 0 (upstream DR range).
+# wandb (one_policy_to_run_them_all/mjx/wandb_logger.py; ModuMorph-wandbutils-compatible config + metric names):
+#   WANDB_MODE online (default) | offline (sync later: wandb sync <out>/wandb/offline-run-*) | disabled; URMA_WANDB=0 also disables.
+#   URMA_WANDB_ENTITY (default velythyl), URMA_WANDB_PROJECT (default urma_context). Key: WANDB_API_KEY or ~/.netrc.
+#   The run id lives in <out>/wandb_run_id, so every chained job resumes the same wandb run. wandb errors never stop training.
 #SBATCH --partition=unkillable
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=ampere|lovelace

@@ -749,7 +749,10 @@ class MJXRobotEnv:
         curv = jnp.array([local_lin[0], local_lin[1], ang[2]])
         perc = jnp.mean(1 - jnp.abs(curv - goal) / jnp.abs(goal))
         perc = jnp.where(jnp.isfinite(perc), jnp.maximum(perc, 0.0), 0.0)
-        return reward, perc, jnp.sum((curv - goal) ** 2)
+        # per-term contributions (pre-clip), logging only; order = wandb_logger.REWARD_TERMS
+        terms = jnp.stack([jnp.asarray(x, jnp.float32) for x in (track_xy, track_yaw, r_z, r_ang, r_pos, r_nom, r_lim, r_vel,
+                                                                  r_acc, r_tq, r_ar, r_col, r_h, r_air, r_sym)])
+        return reward, perc, jnp.sum((curv - goal) ** 2), terms
 
 
     # ------------------------------------------------------------------ batched API
@@ -837,14 +840,15 @@ class MJXRobotEnv:
             obs = self._observation(ko1, dd, dr1, goal1, action1, s1.timers, foot1)
             trunc = s1.episode_step + 1 >= self.horizon
             type_steps = s1.steps_done.astype(jnp.float32) * self.nr_envs_per_type
-            reward, perc, track_err = self._reward(dd, dr1, goal1, action1, s1.last_action, s1.prev_joint_vel, s1.timers, foot1, nrc1, type_steps)
+            reward, perc, track_err, terms = self._reward(dd, dr1, goal1, action1, s1.last_action, s1.prev_joint_vel, s1.timers, foot1, nrc1, type_steps)
             timers = jnp.where(foot1, 0.0, s1.timers + self.dt)
             done = term1 | trunc
             sum_track = s1.sum_track + perc
             ep_ret = s1.episode_return + reward
             info = {"reward": reward, "terminated": term1, "truncated": trunc, "done": done,
                     "episode_return": ep_ret, "episode_length": s1.episode_step + 1,
-                    "eps_track_perf_perc": sum_track / self.horizon, "track_perf_perc": perc, "track_err_sq": track_err}
+                    "eps_track_perf_perc": sum_track / self.horizon, "track_perf_perc": perc, "track_err_sq": track_err,
+                    "reward_terms": terms}
             return obs, timers, sum_track, ep_ret, info
 
         obs, timers, sum_track, ep_ret, info = jax.vmap(post)(d, dr, goal, action, s, ko, foot, nr_coll, term_c | unstable)
@@ -852,6 +856,7 @@ class MJXRobotEnv:
         info["episode_return"] = jnp.where(unstable, s.episode_return, info["episode_return"])
         ep_ret = info["episode_return"]
         info["sim_unstable"] = unstable
+        info["reward_terms"] = jnp.where(unstable[:, None], 0.0, info["reward_terms"])
         info["ctrl"] = tau  # applied torques (probes only; DCE'd in training)
         if self.impl == "warp":  # buffer-pressure diagnostics (overflow bits are sticky per world)
             imp = d._impl
