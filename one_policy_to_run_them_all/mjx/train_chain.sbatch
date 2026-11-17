@@ -5,7 +5,8 @@
 #   sbatch --job-name=urma-mjx-<tag> --time=2-00:00:00 train_chain.sbatch --out <run_dir> [train_mjx.py args...]
 #   MAX_WALL_S defaults to the job's time limit minus 20 min.
 # GPU recipe deviations (train_mjx.py defaults, logged as "recipe_deviations_gpu" + <out>/config-<job>.json):
-#   --solimp_dmax_clamp 0.99, --friction_tangential_floor 0.3 (DR tangential mu in [0.3, 2.0]; upstream [0.001, 2.0]).
+#   --solimp_dmax_clamp 0.99, --physics_overrides '{"impratio_adapt_mu0": 0.3}' (per-world impratio lowered only for
+#   DR tangential mu < 0.3; model identical to upstream for mu >= 0.3); --friction_tangential_floor 0 (upstream DR range).
 #SBATCH --partition=unkillable
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=ampere|lovelace

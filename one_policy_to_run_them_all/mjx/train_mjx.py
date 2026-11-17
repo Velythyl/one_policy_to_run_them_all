@@ -74,10 +74,13 @@ def parse():
     p.add_argument("--contacts_per_env", type=int, default=64)
     p.add_argument("--solimp_dmax_clamp", type=float, default=0.99,
                    help="cap geom solimp dmax (float32 Warp blows up at impedance ~1: go1/anymal/badger feet); 0 = off")
-    p.add_argument("--friction_tangential_floor", type=float, default=0.3,
-                   help="RECIPE DEVIATION (GPU only, user decision 2026-11-17): DR tangential friction sampled in "
-                        "[max(min, floor), max] (upstream min 0.001 for 13 robots); float32 Warp diverges at low mu. 0 = upstream")
-    p.add_argument("--physics_overrides", default="", help="JSON GPU-only physics overrides (MJXRobotEnv.physics_overrides); experiments")
+    p.add_argument("--friction_tangential_floor", type=float, default=0.0,
+                   help="DR tangential friction sampled in [max(min, floor), max]; 0 = upstream range (default since the "
+                        "adaptive-impratio fix; was 0.3)")
+    p.add_argument("--physics_overrides", default='{"impratio_adapt_mu0": 0.3}',
+                   help="RECIPE DEVIATION (GPU only, user-approved 2026-11-17): JSON GPU physics overrides (MJXRobotEnv.physics_overrides). "
+                        "Default: per-world impratio = impratio * min(1, g(mu)/g(0.3)), g = mu^2 (1 + mu^2): identical model for DR "
+                        "friction mu >= 0.3, softer friction rows below (float32 Warp blows up there otherwise). '' = none")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     p.add_argument("--save_every", type=int, default=50)
@@ -131,6 +134,7 @@ def main():
                       "impl": a.impl, "arm": a.context_arm, "variant": a.model_variant}), flush=True)
     deviations = {"solimp_dmax_clamp": a.solimp_dmax_clamp,  # float32 Warp: cap contact impedance dmax
                   "friction_tangential_floor": a.friction_tangential_floor, "physics_overrides": a.physics_overrides}  # DR tangential mu in [floor, max]
+    deviations["applied_impratio_adapt_mu0"] = {e.spec.name: e.impratio_adapt_mu0 for e in envs + eval_envs}
     print(json.dumps({"recipe_deviations_gpu": deviations}), flush=True)
     cfg = {"args": vars(a), "recipe_deviations_gpu": deviations, "warp_ffi": list(WARP_FFI_CONFIG)}
     (out / f"config-{os.environ.get('SLURM_JOB_ID', 'local')}.json").write_text(json.dumps(cfg, indent=1))
