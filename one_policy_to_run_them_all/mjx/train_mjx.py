@@ -82,6 +82,27 @@ def parse():
     return p.parse_args()
 
 
+def gpu_mem_diag():
+    """GiB: XLA allocator in use / peak, Warp mempool current / high, device free; # Warp-captured graphs."""
+    import warp as wp
+    from mujoco.mjx.warp import ffi as mffi
+    g = 2 ** 30
+    out = {}
+    try:
+        ms = jax.devices()[0].memory_stats() or {}
+        out["mem/xla_in_use"] = round(ms.get("bytes_in_use", 0) / g, 2)
+        out["mem/xla_peak"] = round(ms.get("peak_bytes_in_use", 0) / g, 2)
+        out["mem/warp_pool"] = round(wp.get_mempool_used_mem_current("cuda:0") / g, 2)
+        out["mem/warp_pool_high"] = round(wp.get_mempool_used_mem_high("cuda:0") / g, 2)
+        dev = wp.get_device("cuda:0")
+        out["mem/dev_free"] = round(dev.free_memory / g, 2)
+        out["mem/warp_graphs"] = sum(len(getattr(c, "captures", {})) for c in mffi._JAX_CALLABLE_VARIADIC_TUPLE_REGISTRY.values())
+        out["mem/warp_callables"] = len(mffi._JAX_CALLABLE_VARIADIC_TUPLE_REGISTRY)
+    except Exception as e:  # diagnostics only
+        out["mem/error"] = repr(e)[:200]
+    return out
+
+
 def main():
     a = parse()
     out = Path(a.out)
@@ -164,7 +185,8 @@ def main():
                                   term=info["terminated"].astype(jnp.float32), done=info["done"],
                                   ep_ret=info["episode_return"], ep_len=info["episode_length"],
                                   eps_track=info["eps_track_perf_perc"], track_err=info["track_err_sq"],
-                                  unstable=info["sim_unstable"].astype(jnp.float32)))
+                                  unstable=info["sim_unstable"].astype(jnp.float32),
+                                  **{k: info[k].astype(jnp.float32) for k in info if k.startswith("ovf_") or k in ("nacon_frac", "nefc_max")}))
             return (new_states, key), trans
         (states, key), traj = jax.lax.scan(body, (states, key), None, length=T)
         return states, key, traj
@@ -223,7 +245,9 @@ def main():
         met["explained_var"] = 1 - jnp.var(allret - allval) / (jnp.var(allret) + 1e-8)
         return pstate, cstate, met, key
 
-    @jax.jit
+    # Donating the carried state keeps XLA's buffer addresses stationary across iterations, so Warp's
+    # address-keyed CUDA graphs (GraphMode.WARP) are re-used instead of re-captured every iteration.
+    @partial(jax.jit, donate_argnums=(0, 1, 2) if os.environ.get("URMA_DONATE", "1") == "1" else ())
     def iteration(pstate, cstate, states, key):
         states, key, traj = rollout(pstate, cstate, states, key)
         pstate, cstate, met, key = update(pstate, cstate, traj, key)
@@ -239,6 +263,8 @@ def main():
                 "step_reward": tr["rew"].mean(),
                 "track_err_sq": tr["track_err"].mean(),
                 "sim_unstable": tr["unstable"].sum(),
+                **{k: tr[k][-1].sum() for k in tr if k.startswith("ovf_")},  # worlds ever flagged (sticky)
+                **{k: tr[k].max() for k in ("nacon_frac", "nefc_max") if k in tr},
             }
         return pstate, cstate, states, key, met, stats
 
@@ -315,6 +341,7 @@ def main():
             ev = jax.device_get(evaluate(pstate.params, ke))
             rec.update({f"eval/{r}/{k}": float(v) for r, s_ in ev.items() for k, v in s_.items()})
             rec["eval_s"] = round(time.time() - te, 1)
+        rec.update(gpu_mem_diag())
         log.write(json.dumps(rec) + "\n"); log.flush()
         if (it + 1) % 5 == 0 or it == start_iter + 1:
             print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in rec.items()}), flush=True)

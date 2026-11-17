@@ -32,22 +32,29 @@ from one_policy_to_run_them_all.context import limb_context as lc
 
 
 def configure_warp_ffi():
-    """MJX-Warp wraps every mjwarp call in a Warp-captured CUDA graph (GraphMode.WARP) cached per
-    buffer-address set, at most 32 per callable. With 16+ robot types the address sets exceed the
-    cache: graphs are re-captured every call (slow) and each capture holds its own temporaries
-    (OOM on a 40 GB A100 after 4 iterations). Env knobs (set before the first trace):
+    """MJX-Warp wraps every mjwarp call in a Warp-captured CUDA graph (GraphMode.WARP), cached per
+    FFI callable and per set of buffer addresses (Warp default: up to 32 graphs per callable). With
+    16 robot types (64 callables: step + forward per robot) XLA hands the step/forward calls new
+    buffer addresses every PPO iteration, so ~32 new graphs are captured per iteration and never
+    evicted; each captured graph keeps its own graph-allocated temporaries (collision/solver scratch),
+    and after ~4 iterations (~150 graphs) the next in-capture allocation fails ("Failed to allocate
+    72351744 bytes" in convex_narrowphase) although cudaMemGetInfo still reports >30 GB free.
+    Fix (default): keep at most 1 graph per callable -> stale graphs are destroyed on re-capture
+    (re-capture costs ~nothing: 44k sps either way). Measured on 16 robots x 1024 x 32 (L40S):
+      warp, cache 32 -> OOM at iteration 5;  warp, cache 1 -> 44k sps, flat memory;
+      warp_staged_ex -> 34k sps, flat memory;  none -> very slow;  jax -> CUDA_ERROR_NOT_SUPPORTED.
+    Env knobs (read at import, before the first trace):
       URMA_WARP_GRAPH_MODE = warp | warp_staged_ex | warp_staged | jax | none   (default warp)
-      URMA_WARP_GRAPH_CACHE = max cached graphs per callable                     (default 32)"""
+      URMA_WARP_GRAPH_CACHE = max cached graphs per callable                     (default 1)"""
     import os
     import warp as wp
     from mujoco.mjx.warp import ffi as mffi
     from warp._src.jax import ffi as wffi
     mode = os.environ.get("URMA_WARP_GRAPH_MODE", "warp").upper()
-    gm = getattr(wp.JaxCallableGraphMode, mode)
-    d = list(mffi.jax_callable_variadic_tuple.__defaults__)
-    d[1] = gm  # (num_outputs, graph_mode, vmap_method, ...)
-    mffi.jax_callable_variadic_tuple.__defaults__ = tuple(d)
-    cache = int(os.environ.get("URMA_WARP_GRAPH_CACHE", 32))
+    getattr(wp.JaxCallableGraphMode, mode)  # validate
+    # NB: MJX passes graph_mode=m.opt._impl.graph_mode explicitly to every FFI wrapper, so the mode
+    # must be set through mjx.put_model(graph_mode=...) (see MJXRobotEnv), not via wrapper defaults.
+    cache = int(os.environ.get("URMA_WARP_GRAPH_CACHE", 1))
     import inspect
     names = [p for p in inspect.signature(wffi.jax_callable).parameters.values() if p.default is not inspect.Parameter.empty]
     dd = list(wffi.jax_callable.__defaults__)
@@ -211,7 +218,11 @@ class MJXRobotEnv:
             m.geom_solimp[:, 0] = np.minimum(m.geom_solimp[:, 0], self.solimp_dmax_clamp)
             self.solimp_clamped_geoms = np.nonzero(hit)[0].tolist()
         self.mj_model = m
-        self.mx = mjx.put_model(m, impl=self.impl)
+        if self.impl == "warp":
+            from mujoco.mjx.warp import types as mjxw_types
+            self.mx = mjx.put_model(m, impl=self.impl, graph_mode=getattr(mjxw_types.GraphMode, WARP_FFI_CONFIG[0]))
+        else:
+            self.mx = mjx.put_model(m, impl=self.impl)
         self.n = len(c["joint_names"])
         self.nf = len(c["foot_names"])
         self.nu = m.nu
@@ -740,6 +751,14 @@ class MJXRobotEnv:
         info["episode_return"] = jnp.where(unstable, s.episode_return, info["episode_return"])
         ep_ret = info["episode_return"]
         info["sim_unstable"] = unstable
+        info["ctrl"] = tau  # applied torques (probes only; DCE'd in training)
+        if self.impl == "warp":  # buffer-pressure diagnostics (overflow bits are sticky per world)
+            imp = d._impl
+            ov = jnp.asarray(imp.overflow).reshape(N, -1).max(-1)
+            for name, bit in (("nefc", 1), ("broad", 4), ("narrow", 8), ("ccd", 16), ("epa", 256), ("iters", 512)):
+                info[f"ovf_{name}"] = (ov & bit) > 0
+            info["nacon_frac"] = jnp.asarray(imp.nacon).reshape(-1)[0] / (N * self.contacts_per_env)
+            info["nefc_max"] = jnp.asarray(imp.nefc).reshape(-1).max()
         info["qpos_next"], info["qvel_next"] = d.qpos, d.qvel  # pre-autoreset state (checks only; DCE'd in training)
         info["final_obs"] = obs
         done = info["done"]
