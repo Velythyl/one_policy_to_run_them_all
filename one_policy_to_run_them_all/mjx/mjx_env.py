@@ -543,15 +543,30 @@ class MJXRobotEnv:
         the DR-dependent fields (seen nominal/range, D, gains, mass) from this env's DR state."""
         f = {k: jnp.asarray(v, jnp.float32) for k, v in self.ctx_fields.items()}
         col = lambda x: x.reshape(self.n, 1)
-        f["joint_range"] = dr.seen_range[self.jnt_idx] / 4.6
-        f["nominal_pos"] = col(dr.seen_nominal / 4.6)
-        f["torque_limit"] = col(dr.seen_torque / (1000.0 / 2) - 1.0)
-        f["max_joint_vel"] = col(dr.seen_vel / (35.0 / 2) - 1.0)
-        f["damping"] = col(dr.seen_damping[self.dof_idx] / (10.0 / 2) - 1.0)
-        f["armature"] = col(dr.seen_armature[self.dof_idx] / (0.2 / 2) - 1.0)
-        f["stiffness"] = col(dr.seen_stiffness[self.jnt_idx] / (30.0 / 2) - 1.0)
-        f["frictionloss"] = col(dr.seen_friction[self.dof_idx] / (1.2 / 2) - 1.0)
-        # link mass / inertia: only the trunk mass is randomised, and the trunk is never a limb
+        # URMA stock fields (urma arm), URMA normalisation
+        f["urma_joint_range"] = dr.seen_range[self.jnt_idx] / 4.6
+        f["urma_nominal_pos"] = col(dr.seen_nominal / 4.6)
+        f["urma_torque_limit"] = col(dr.seen_torque / (1000.0 / 2) - 1.0)
+        f["urma_max_joint_vel"] = col(dr.seen_vel / (35.0 / 2) - 1.0)
+        f["urma_damping"] = col(dr.seen_damping[self.dof_idx] / (10.0 / 2) - 1.0)
+        f["urma_armature"] = col(dr.seen_armature[self.dof_idx] / (0.2 / 2) - 1.0)
+        f["urma_stiffness"] = col(dr.seen_stiffness[self.jnt_idx] / (30.0 / 2) - 1.0)
+        f["urma_frictionloss"] = col(dr.seen_friction[self.dof_idx] / (1.2 / 2) - 1.0)
+        # ModuMorph D fields (seen DR values), ModuMorph min-max with the refit bounds (limb_context.mm_normalise)
+        B = lc.modumorph_bounds()
+
+        def mm(name, x):
+            lo, hi = (jnp.asarray(v, jnp.float32) for v in B[name])
+            return -1.0 * (lo != hi) + 2.0 * (x - lo) / (hi - lo + 1e-8)
+        f["joint_range"] = mm("joint_range", dr.seen_range[self.jnt_idx])
+        f["nominal_pos"] = mm("nominal_pos", col(dr.seen_nominal))
+        f["gear"] = mm("gear", col(dr.seen_torque))
+        f["max_joint_vel"] = mm("max_joint_vel", col(dr.seen_vel))
+        f["damping"] = mm("damping", col(dr.seen_damping[self.dof_idx]))
+        f["armature"] = mm("armature", col(dr.seen_armature[self.dof_idx]))
+        f["stiffness"] = mm("stiffness", col(dr.seen_stiffness[self.jnt_idx]))
+        f["frictionloss"] = mm("frictionloss", col(dr.seen_friction[self.dof_idx]))
+        # body_mass (limbs): only the trunk mass is randomised and the trunk is never a limb -> static field from the config
         gains = jnp.stack([self.P["control"]["p_gain"] + dr.add_p, self.P["control"]["d_gain"] + dr.add_d,
                            self.P["control"]["scaling_factor"] + dr.add_scale])
         mass = jnp.sum(jnp.asarray(self.def_body_mass, jnp.float32).at[1].set(dr.seen_trunk_mass))

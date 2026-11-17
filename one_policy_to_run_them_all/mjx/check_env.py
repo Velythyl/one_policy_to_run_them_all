@@ -33,6 +33,6 @@ for r in robots:
     keys = jax.random.split(jax.random.PRNGKey(1), B)
     dr2 = jax.vmap(env._sample_dr)(keys, st.dr)
     jd2 = jax.vmap(lambda d: env.descriptions(d)[0])(dr2)
-    tl = env.layout.field_slice("torque_limit")
+    tl = env.layout.field_slice("gear")
     assert not np.allclose(np.asarray(jd2[0, :, tl]), np.asarray(jd2[1, :, tl])), "D not per-env"
     print(r, "per-env D follows DR ok", flush=True)
