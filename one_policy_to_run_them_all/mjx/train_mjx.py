@@ -69,6 +69,7 @@ def parse():
     p.add_argument("--out", required=True)
     p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--bench_iters", type=int, default=0, help=">0: only time this many iterations")
+    p.add_argument("--debug_finite", action="store_true", help="report non-finite leaves of the first rollout")
     return p.parse_args()
 
 
@@ -146,7 +147,8 @@ def main():
                 trans.append(dict(obs=o, act=act, logp=logp, val=v, next_val=nv, rew=info["reward"],
                                   term=info["terminated"].astype(jnp.float32), done=info["done"],
                                   ep_ret=info["episode_return"], ep_len=info["episode_length"],
-                                  eps_track=info["eps_track_perf_perc"], track_err=info["track_err_sq"]))
+                                  eps_track=info["eps_track_perf_perc"], track_err=info["track_err_sq"],
+                                  unstable=info["sim_unstable"].astype(jnp.float32)))
             return (new_states, key), trans
         (states, key), traj = jax.lax.scan(body, (states, key), None, length=T)
         return states, key, traj
@@ -220,9 +222,21 @@ def main():
                 "eps_track_perf": jnp.where(cnt > 0, (tr["eps_track"] * dn).sum() / jnp.maximum(cnt, 1), jnp.nan),
                 "step_reward": tr["rew"].mean(),
                 "track_err_sq": tr["track_err"].mean(),
+                "sim_unstable": tr["unstable"].sum(),
             }
         return pstate, cstate, states, key, met, stats
 
+    if a.debug_finite:
+        st_, k_, traj_ = jax.jit(rollout)(pstate, cstate, states, key)
+        for r, tr in zip(robots, traj_):
+            for path, x in jax.tree_util.tree_leaves_with_path(tr):
+                if jnp.issubdtype(x.dtype, jnp.floating):
+                    bad = ~jnp.isfinite(x)
+                    if bool(bad.any()):
+                        t_first = int(jnp.argmax(bad.reshape(bad.shape[0], -1).any(-1)))
+                        print("NONFINITE", r, jax.tree_util.keystr(path), "first t", t_first, "frac", float(bad.mean()), flush=True)
+        print("debug_finite done", flush=True)
+        return
     log = open(out / "log.jsonl", "a")
     t_compile = time.time()
     n_run = a.bench_iters if a.bench_iters > 0 else nr_iters

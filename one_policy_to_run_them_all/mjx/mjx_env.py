@@ -292,8 +292,17 @@ class MJXRobotEnv:
             friction_ground=f32(fg), friction_feet=f32(ff), solref=f32(solref), gravity_z=f32(grav), delay_mixed=mixed,
         )
 
+    DR_MODEL_FIELDS = ("body_mass", "body_inertia", "body_ipos", "geom_size", "geom_friction", "geom_solref",
+                       "actuator_ctrlrange", "jnt_range", "dof_damping", "dof_armature", "dof_frictionloss",
+                       "jnt_stiffness", "opt")
+
     def model_for(self, dr: DR):
         """MJX model with this env's DR values written in (used inside vmap -> batched model)."""
+        full = self._model_for_all(dr)
+        keep = getattr(self, "dr_model_fields", self.DR_MODEL_FIELDS)
+        return self.mx.replace(**{k: getattr(full, k) for k in keep})
+
+    def _model_for_all(self, dr: DR):
         mx = self.mx
         body_mass = mx.body_mass.at[1].set(dr.body_mass_trunk)
         body_inertia = mx.body_inertia.at[1].set(dr.body_inertia_trunk)
@@ -555,6 +564,12 @@ class MJXRobotEnv:
         d = s.data.replace(ctrl=tau)
         stepper = jax.vmap(mjx.step, in_axes=(0, 0))
         d = jax.lax.fori_loop(0, self.nsub, lambda i, dd: stepper(models, dd), d)
+        # Diverged worlds: MuJoCo C (CPU env) auto-resets such data (mj_checkPos/Vel/Acc warnings);
+        # MJX/Warp does not. Here: roll the world back to its pre-step state, end the episode
+        # (terminated) with zero reward, and count it in info["sim_unstable"].
+        unstable = ~(jnp.all(jnp.isfinite(d.qpos), axis=-1) & jnp.all(jnp.isfinite(d.qvel), axis=-1)
+                     & jnp.all(jnp.abs(d.qvel) < 1e4, axis=-1))
+        d = merge_data(unstable, s.data, d, self.impl)
 
         def post_physics(key1, d_qvel, dr):
             key1, kdr, kdrs, kp, kps, ko, kr = jax.random.split(key1, 7)
@@ -591,7 +606,11 @@ class MJXRobotEnv:
                     "eps_track_perf_perc": sum_track / self.horizon, "track_perf_perc": perc, "track_err_sq": track_err}
             return obs, timers, sum_track, ep_ret, info
 
-        obs, timers, sum_track, ep_ret, info = jax.vmap(post)(d, dr, goal, action, s, ko, foot, nr_coll, term_c)
+        obs, timers, sum_track, ep_ret, info = jax.vmap(post)(d, dr, goal, action, s, ko, foot, nr_coll, term_c | unstable)
+        info["reward"] = jnp.where(unstable, 0.0, info["reward"])
+        info["episode_return"] = jnp.where(unstable, s.episode_return, info["episode_return"])
+        ep_ret = info["episode_return"]
+        info["sim_unstable"] = unstable
         info["final_obs"] = obs
         done = info["done"]
         # ---- autoreset of done envs: keep DR, goal and the env's step counter (as on CPU)
