@@ -31,7 +31,7 @@ import signal
 import sys
 
 from one_policy_to_run_them_all.mjx.robot_spec import load_spec, TRAIN_16, EVAL_4
-from one_policy_to_run_them_all.mjx.mjx_env import MJXRobotEnv
+from one_policy_to_run_them_all.mjx.mjx_env import MJXRobotEnv, WARP_FFI_CONFIG
 
 PPO_DIR = Path(__file__).resolve().parents[1] / "algorithms" / "uni_ppo" / "ppo"
 
@@ -74,9 +74,9 @@ def parse():
     p.add_argument("--contacts_per_env", type=int, default=64)
     p.add_argument("--solimp_dmax_clamp", type=float, default=0.99,
                    help="cap geom solimp dmax (float32 Warp blows up at impedance ~1: go1/anymal/badger feet); 0 = off")
-    p.add_argument("--friction_tangential_floor", type=float, default=0.0,
-                   help="GPU deviation (off by default): DR tangential friction sampled in [max(min, floor), max]; "
-                        "Warp diverges for mu < ~0.05 (upstream min 0.001 for 13 robots)")
+    p.add_argument("--friction_tangential_floor", type=float, default=0.3,
+                   help="RECIPE DEVIATION (GPU only, user decision 2026-11-17): DR tangential friction sampled in "
+                        "[max(min, floor), max] (upstream min 0.001 for 13 robots); float32 Warp diverges at low mu. 0 = upstream")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     p.add_argument("--save_every", type=int, default=50)
@@ -128,6 +128,11 @@ def main():
     print(json.dumps({"robots": robots, "nr_envs_per_type": N, "nr_steps": T, "batch": steps_per_iter,
                       "minibatch_per_type": mb, "iters": nr_iters, "gpu": jax.devices()[0].device_kind,
                       "impl": a.impl, "arm": a.context_arm, "variant": a.model_variant}), flush=True)
+    deviations = {"solimp_dmax_clamp": a.solimp_dmax_clamp,  # float32 Warp: cap contact impedance dmax
+                  "friction_tangential_floor": a.friction_tangential_floor}  # DR tangential mu in [floor, max]
+    print(json.dumps({"recipe_deviations_gpu": deviations}), flush=True)
+    cfg = {"args": vars(a), "recipe_deviations_gpu": deviations, "warp_ffi": list(WARP_FFI_CONFIG)}
+    (out / f"config-{os.environ.get('SLURM_JOB_ID', 'local')}.json").write_text(json.dumps(cfg, indent=1))
 
     policy = Policy(1.0, 1.0, 0.015, 1e-8, 10.0, 1e-8, 2.0)
     critic = Critic(1.0, 0.015, 1e-8)

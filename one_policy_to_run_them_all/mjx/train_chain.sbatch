@@ -4,6 +4,8 @@
 # A finished run writes <out>/DONE. Stop a chain: touch <out>/STOP (no further resubmission).
 #   sbatch --job-name=urma-mjx-<tag> --time=2-00:00:00 train_chain.sbatch --out <run_dir> [train_mjx.py args...]
 #   MAX_WALL_S defaults to the job's time limit minus 20 min.
+# GPU recipe deviations (train_mjx.py defaults, logged as "recipe_deviations_gpu" + <out>/config-<job>.json):
+#   --solimp_dmax_clamp 0.99, --friction_tangential_floor 0.3 (DR tangential mu in [0.3, 2.0]; upstream [0.001, 2.0]).
 #SBATCH --partition=unkillable
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=ampere|lovelace
