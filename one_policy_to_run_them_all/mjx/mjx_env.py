@@ -123,6 +123,28 @@ def merge_data(done, reset_d, step_d, impl):
     return jax.tree_util.tree_map_with_path(leaf, reset_d, step_d)
 
 
+def primitive_collision_model(xml_path, m0):
+    """Replace every colliding mesh geom by a box fitted to its compiled AABB (same geom ids, so
+    all index tables still hold). Body inertials are copied back from the original model so only
+    the collision shapes change."""
+    spec = mujoco.MjSpec.from_file(xml_path)
+    for i, g in enumerate(spec.geoms):
+        if m0.geom_type[i] != mujoco.mjtGeom.mjGEOM_MESH or not (m0.geom_contype[i] or m0.geom_conaffinity[i]):
+            continue
+        center, half = m0.geom_aabb[i, :3], m0.geom_aabb[i, 3:]
+        rot = np.zeros(9); mujoco.mju_quat2Mat(rot, m0.geom_quat[i])
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.meshname = ""
+        g.size = np.maximum(half, 1e-4)
+        g.pos = m0.geom_pos[i] + rot.reshape(3, 3) @ center
+        g.quat = m0.geom_quat[i]
+    m = spec.compile()
+    assert m.ngeom == m0.ngeom and m.nbody == m0.nbody
+    for f in ("body_mass", "body_inertia", "body_ipos", "body_iquat"):
+        getattr(m, f)[:] = getattr(m0, f)
+    return m
+
+
 @dataclass
 class MJXRobotEnv:
     spec: RobotSpec
@@ -135,6 +157,8 @@ class MJXRobotEnv:
     def __post_init__(self):
         sp, c = self.spec, self.spec.cfg
         m = mujoco.MjModel.from_xml_path(str(sp.xml_path))
+        if self.model_variant == "primitives":
+            m = primitive_collision_model(str(sp.xml_path), m)
         m.opt.timestep = c["timestep"]
         if self.model_variant == "feet_only":
             keep = set(c["collision_groups"]["floor"])

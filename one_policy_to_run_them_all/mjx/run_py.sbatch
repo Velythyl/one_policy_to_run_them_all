@@ -5,7 +5,7 @@
 #SBATCH --constraint=ampere|lovelace
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/network/scratch/c/charlie.gauthier/urma_context/jobs/%x-%j.out
 export XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 MUJOCO_GL=egl
 export PYTHONPATH=/network/scratch/c/charlie.gauthier/urma_context/urma-mjx-wt
