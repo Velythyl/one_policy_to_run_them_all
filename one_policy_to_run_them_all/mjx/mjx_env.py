@@ -23,6 +23,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import json
 import mujoco
 import numpy as np
 from flax import struct
@@ -243,6 +244,11 @@ class MJXRobotEnv:
     contacts_per_env: int = 64
     solimp_dmax_clamp: float = 0.0  # >0: cap geom solimp dmax (see __post_init__)
     friction_tangential_floor: float = 0.0  # >0: DR tangential friction sampled in [max(min, floor), max]
+    # JSON dict of GPU-only physics overrides (experiments; "" = none): cone (elliptic|pyramidal),
+    # impratio, iterations, ls_iterations, tolerance, ls_tolerance, noslip_iterations, solver (cg|newton),
+    # substep_mult k (timestep/k, k x substeps), robots [only apply to these robot names]
+    physics_overrides: str = ""
+    impratio_adapt_mu0: float = 0.0  # >0: per-world impratio lowered for DR friction mu < mu0 (see _model_for_all)
 
     def __post_init__(self):
         sp, c = self.spec, self.spec.cfg
@@ -267,6 +273,25 @@ class MJXRobotEnv:
             m.geom_solimp[hit, 1] = self.solimp_dmax_clamp
             m.geom_solimp[:, 0] = np.minimum(m.geom_solimp[:, 0], self.solimp_dmax_clamp)
             self.solimp_clamped_geoms = np.nonzero(hit)[0].tolist()
+        self.substep_mult = 1
+        ov = json.loads(self.physics_overrides) if self.physics_overrides else {}
+        if ov and (not ov.get("robots") or self.spec.name in ov["robots"]):
+            for k, v in ov.items():
+                if k == "robots":
+                    continue
+                if k == "impratio_adapt_mu0":
+                    self.impratio_adapt_mu0 = float(v)
+                    continue
+                if k == "cone":
+                    m.opt.cone = {"elliptic": mujoco.mjtCone.mjCONE_ELLIPTIC, "pyramidal": mujoco.mjtCone.mjCONE_PYRAMIDAL}[v]
+                elif k == "solver":
+                    m.opt.solver = {"cg": mujoco.mjtSolver.mjSOL_CG, "newton": mujoco.mjtSolver.mjSOL_NEWTON}[v]
+                elif k == "substep_mult":
+                    self.substep_mult = int(v)
+                    m.opt.timestep = m.opt.timestep / int(v)
+                else:
+                    setattr(m.opt, k, type(getattr(m.opt, k))(v))
+            self.physics_overrides_applied = ov
         self.mj_model = m
         if self.impl == "warp":
             from mujoco.mjx.warp import types as mjxw_types
@@ -283,7 +308,7 @@ class MJXRobotEnv:
         P = c["params"]
         self.P = P
         self.dt = c["dt"]
-        self.nsub = c["nr_substeps"]
+        self.nsub = c["nr_substeps"] * self.substep_mult
         self.horizon = c["horizon"]
         d = c["defaults"]
         f64 = lambda x: np.asarray(x, dtype=np.float64)
@@ -498,6 +523,15 @@ class MJXRobotEnv:
         dof_frictionloss = mx.dof_frictionloss.at[6:].set(dr.frictionloss)
         jnt_stiffness = mx.jnt_stiffness.at[1:].set(dr.stiffness)
         opt = mx.opt.replace(gravity=mx.opt.gravity.at[2].set(dr.gravity_z))
+        if self.impratio_adapt_mu0 > 0 and self.impl == "warp":
+            # Per-world impratio so that the pyramidal friction regulariser R ~ 2 mu^2 (1 + mu^2) / impratio never
+            # drops below its value at mu0 with the model impratio: worlds with mu >= mu0 keep the exact model
+            # physics; lower-mu worlds get proportionally softer (lower impratio) friction rows.
+            mu = dr.friction_ground[0] if self.model_struct["friction_mode"] == "ground_feet" else jnp.max(dr.friction_feet[..., 0])
+            g = lambda u: u * u * (1.0 + u * u)
+            imp = self.mj_model.opt.impratio * jnp.minimum(1.0, g(mu) / g(self.impratio_adapt_mu0))
+            isq = opt._impl.impratio_invsqrt
+            opt = opt.replace(_impl=opt._impl.replace(impratio_invsqrt=jnp.broadcast_to(1.0 / jnp.sqrt(imp), isq.shape).astype(isq.dtype)))
         return mx.replace(body_mass=body_mass, body_inertia=body_inertia, body_ipos=body_ipos, geom_size=geom_size,
                           geom_friction=geom_friction, geom_solref=geom_solref, actuator_ctrlrange=ctrlrange,
                           jnt_range=jnt_range, dof_damping=dof_damping, dof_armature=dof_armature,

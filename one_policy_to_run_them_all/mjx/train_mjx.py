@@ -77,6 +77,7 @@ def parse():
     p.add_argument("--friction_tangential_floor", type=float, default=0.3,
                    help="RECIPE DEVIATION (GPU only, user decision 2026-11-17): DR tangential friction sampled in "
                         "[max(min, floor), max] (upstream min 0.001 for 13 robots); float32 Warp diverges at low mu. 0 = upstream")
+    p.add_argument("--physics_overrides", default="", help="JSON GPU-only physics overrides (MJXRobotEnv.physics_overrides); experiments")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     p.add_argument("--save_every", type=int, default=50)
@@ -114,11 +115,11 @@ def main():
     R = len(robots)
     N, T = a.nr_envs, a.nr_steps
     envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
-                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor) for r in robots]
+                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor, physics_overrides=a.physics_overrides) for r in robots]
     eval_robots = [r for r in a.eval_robots.split(",") if r]
     eval_envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
                              nr_envs_per_type=a.eval_envs, model_variant=a.model_variant, eval_mode=True,
-                             contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor) for r in eval_robots]
+                             contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor, physics_overrides=a.physics_overrides) for r in eval_robots]
     batch_per_type = N * T
     assert batch_per_type % a.nr_minibatches == 0
     mb = batch_per_type // a.nr_minibatches
@@ -129,7 +130,7 @@ def main():
                       "minibatch_per_type": mb, "iters": nr_iters, "gpu": jax.devices()[0].device_kind,
                       "impl": a.impl, "arm": a.context_arm, "variant": a.model_variant}), flush=True)
     deviations = {"solimp_dmax_clamp": a.solimp_dmax_clamp,  # float32 Warp: cap contact impedance dmax
-                  "friction_tangential_floor": a.friction_tangential_floor}  # DR tangential mu in [floor, max]
+                  "friction_tangential_floor": a.friction_tangential_floor, "physics_overrides": a.physics_overrides}  # DR tangential mu in [floor, max]
     print(json.dumps({"recipe_deviations_gpu": deviations}), flush=True)
     cfg = {"args": vars(a), "recipe_deviations_gpu": deviations, "warp_ffi": list(WARP_FFI_CONFIG)}
     (out / f"config-{os.environ.get('SLURM_JOB_ID', 'local')}.json").write_text(json.dumps(cfg, indent=1))
