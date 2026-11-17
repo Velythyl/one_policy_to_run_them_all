@@ -13,6 +13,7 @@ Arms (``environment.context_arm``)
 ``d``      [0 | D | G]                     non-latent family
 ``empty``  [0 | 0 | 0]                     non-latent family: the whole token is zeros
 ``vme``    [VME latent | D | G]            latent family, L + 17 wide
+``vmestar`` [VME* (fine-tuned VME) latent | D | G]  latent family
 ``matme``  [MatME latent | D | G]          latent family
 
 Within a family every arm has the same width, so the policy / critic networks are identical
@@ -25,7 +26,7 @@ a robot are identical (the honest no-context baseline, no joint IDs). State obse
 robot-global fields in ``general_state`` are untouched in every arm.
 
 Foot tokens always keep URMA's shape: [foot position (3) | G (7)]. Foot position is kinematics,
-so it is zeroed in every arm without K (``empty``, ``d``, ``vme``, ``matme``); G is zeroed in ``empty``.
+so it is zeroed in every arm without K (``empty``, ``d``, ``vme``, ``vmestar``, ``matme``); G is zeroed in ``empty``.
 
 D values use URMA's domain-randomised "seen" values (``seen_body_mass``, ``seen_joint_*``) and are
 recomputed whenever ``handle_domain_randomization`` resamples the robot (it calls
@@ -42,7 +43,7 @@ import numpy as np
 
 
 NON_LATENT_ARMS = ("dk", "k", "d", "empty")
-LATENT_ARMS = ("vme", "matme")
+LATENT_ARMS = ("vme", "vmestar", "matme")
 ALL_ARMS = ("urma",) + NON_LATENT_ARMS + LATENT_ARMS
 
 # Geom types kept for the one-hot (plane / hfield / sdf never appear on robot limbs)
@@ -99,7 +100,7 @@ _FIELD_WIDTH = dict(K_FIELDS + D_FIELDS + G_FIELDS)
 
 ARM_BLOCKS_ON = {
     "urma": {"K", "D", "G"}, "dk": {"K", "D", "G"}, "k": {"K", "G"}, "d": {"D", "G"},
-    "empty": set(), "vme": {"LAT", "D", "G"}, "matme": {"LAT", "D", "G"},
+    "empty": set(), "vme": {"LAT", "D", "G"}, "vmestar": {"LAT", "D", "G"}, "matme": {"LAT", "D", "G"},
 }
 
 

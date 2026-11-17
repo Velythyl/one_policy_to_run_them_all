@@ -1,5 +1,5 @@
-"""Write DUMMY per-body latents (random, deterministic) for testing vme / matme wiring.
-Output: <out_root>/{vme,matme}/<robot_dir_name>.json. Never point this at the real latents dir."""
+"""Write DUMMY per-body latents (random, deterministic) for testing vme / vmestar / matme wiring.
+Output: <out_root>/{vme,vmestar,matme}/<robot_dir_name>.json. Never point this at the real latents dir."""
 import json, sys, zlib
 from pathlib import Path
 import mujoco
@@ -9,7 +9,7 @@ from one_policy_to_run_them_all.context.limb_context import robot_dir_name
 
 out_root = Path(sys.argv[1]); dim = int(sys.argv[2]) if len(sys.argv) > 2 else 16
 assert "dummy" in out_root.as_posix(), "dummy latents must go to a path containing 'dummy'"
-for arm, salt in (("vme", 1), ("matme", 2)):
+for arm, salt in (("vme", 1), ("matme", 2), ("vmestar", 3)):
     (out_root / arm).mkdir(parents=True, exist_ok=True)
     for name in ALL_ROBOTS:
         env = build_env(name)

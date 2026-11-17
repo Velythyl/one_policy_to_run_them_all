@@ -9,7 +9,7 @@
 #SBATCH --output=/network/scratch/c/charlie.gauthier/urma_context/jobs/%x-%j.out
 set -uo pipefail
 TOTAL=$1; LATENT_DIR=$2; shift 2
-ARMS=${@:-empty dk d k vme matme}
+ARMS=${@:-empty dk d k vme vmestar matme}
 ROOT=/network/scratch/c/charlie.gauthier/urma_context
 cd $ROOT/runs_cwd
 export XLA_PYTHON_CLIENT_PREALLOCATE=false MUJOCO_GL=egl PYTHONUNBUFFERED=1

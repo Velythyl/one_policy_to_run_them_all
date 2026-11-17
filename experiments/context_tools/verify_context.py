@@ -6,7 +6,7 @@ For every robot x arm (default pose and 3 DR samples, seed 0):
   * widths: equal within an arm family across all robots; foot width 10 everywhere
   * K / D / LAT / G column sets disjoint; switched-off blocks exactly zero
   * empty: joint AND foot tokens all zero (G copies zeroed too); other arms keep G
-  * vme / matme: only latent + D (+ G) columns non-zero; latent equals the file's latent
+  * vme / vmestar / matme: only latent + D (+ G) columns non-zero; latent equals the file's latent
   * dk restricted to URMA's fields == stock URMA values (bitwise), G == stock G,
     D link fields recomputed after DR (seen values), and urma arm == stock
   * no two arms identical for a robot
