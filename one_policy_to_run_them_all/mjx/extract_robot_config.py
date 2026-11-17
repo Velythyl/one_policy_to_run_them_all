@@ -117,9 +117,9 @@ def main():
             "foot_geom_suffix": suffix,
             "eq": {"neq": int(m.neq), "types": [int(t) for t in m.eq_type], "active": [int(a) for a in m.eq_active0]},
         }
-        for arm in ("urma", "dk", "k", "d", "empty", "vme", "vmestar", "matme"):
+        for arm in ("urma",) + lc.NON_LATENT_ARMS + tuple(lc.latent_arms_available(LATENTS_DUMMY, robot)):
             try:
-                e2 = build_env(robot, seed=0, context_arm=arm, latent_dir=LATENTS_DUMMY if arm in lc.LATENT_ARMS else "")
+                e2 = build_env(robot, seed=0, context_arm=arm, latent_dir=LATENTS_DUMMY if lc.is_latent_arm(arm) else "")
             except Exception as ex:  # latent file missing for this robot
                 print(robot, arm, "SKIP", repr(ex)[:200], flush=True)
                 continue

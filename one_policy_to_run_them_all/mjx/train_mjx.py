@@ -51,8 +51,8 @@ def parse():
     p = argparse.ArgumentParser()
     p.add_argument("--robots", default=",".join(TRAIN_16))
     p.add_argument("--eval_robots", default=",".join(EVAL_4), help="unseen robots: evaluated only, never trained on ('' = none)")
-    p.add_argument("--eval_every", type=int, default=0, help="evaluate every N iterations (0 = every 204800/(steps per iter) like CPU uni_ppo, rounded up)")
-    p.add_argument("--eval_envs", type=int, default=64, help="envs per eval robot")
+    p.add_argument("--eval_every", type=int, default=0, help="evaluate every N iterations (0 = every 17233920 env steps, experiments/experiment.sh)")
+    p.add_argument("--eval_envs", type=int, default=50, help="envs per eval robot (experiment.sh: evaluation_episodes=50)")
     p.add_argument("--max_wall_s", type=float, default=0, help=">0: checkpoint and exit(3) after this many seconds (chained jobs)")
     p.add_argument("--nr_envs", type=int, default=4096, help="per robot type")
     p.add_argument("--nr_steps", type=int, default=42)
@@ -241,7 +241,7 @@ def main():
         return pstate, cstate, states, key, met, stats
 
     horizon = max([e.horizon for e in eval_envs] or [1])
-    eval_every = a.eval_every or -(-204800 // steps_per_iter)
+    eval_every = a.eval_every or -(-17233920 // steps_per_iter)
 
     @jax.jit
     def evaluate(pparams, key):

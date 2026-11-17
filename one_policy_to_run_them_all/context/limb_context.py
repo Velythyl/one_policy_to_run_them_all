@@ -43,8 +43,21 @@ import numpy as np
 
 
 NON_LATENT_ARMS = ("dk", "k", "d", "empty")
-LATENT_ARMS = ("vme", "vmestar", "matme")
+LATENT_ARMS = ("vme", "vmestar", "matme", "vme_sa", "vmestar_sa")
 ALL_ARMS = ("urma",) + NON_LATENT_ARMS + LATENT_ARMS
+
+
+def is_latent_arm(arm):
+    """Latent arms are generic: any arm name other than urma / dk / k / d / empty is read from
+    <latent_dir>/<arm>/<robot>.json (layout [latent | D | G])."""
+    return arm not in ("urma",) + NON_LATENT_ARMS and bool(arm) and arm.replace("_", "").isalnum()
+
+
+def latent_arms_available(latent_dir, robot):
+    """Every latent arm with a file for this robot under latent_dir (for the startup guard)."""
+    if not latent_dir or not Path(latent_dir).is_dir():
+        return []
+    return sorted(p.name for p in Path(latent_dir).iterdir() if p.is_dir() and is_latent_arm(p.name) and (p / f"{robot}.json").is_file())
 
 # Geom types kept for the one-hot (plane / hfield / sdf never appear on robot limbs)
 GEOM_TYPE_SLOTS = ("none", "sphere", "capsule", "ellipsoid", "cylinder", "box", "mesh")
@@ -98,10 +111,16 @@ K_WIDTH, D_WIDTH, G_WIDTH = _width(K_FIELDS), _width(D_FIELDS), _width(G_FIELDS)
 _BLOCK_OF = {f: "K" for f, _ in K_FIELDS} | {f: "D" for f, _ in D_FIELDS} | {f: "G" for f, _ in G_FIELDS}
 _FIELD_WIDTH = dict(K_FIELDS + D_FIELDS + G_FIELDS)
 
-ARM_BLOCKS_ON = {
-    "urma": {"K", "D", "G"}, "dk": {"K", "D", "G"}, "k": {"K", "G"}, "d": {"D", "G"},
-    "empty": set(), "vme": {"LAT", "D", "G"}, "vmestar": {"LAT", "D", "G"}, "matme": {"LAT", "D", "G"},
-}
+class _ArmBlocks(dict):
+    def __missing__(self, arm):
+        if is_latent_arm(arm):
+            return {"LAT", "D", "G"}
+        raise KeyError(arm)
+
+
+ARM_BLOCKS_ON = _ArmBlocks({
+    "urma": {"K", "D", "G"}, "dk": {"K", "D", "G"}, "k": {"K", "G"}, "d": {"D", "G"}, "empty": set(),
+})
 
 
 @dataclass(frozen=True)
@@ -127,7 +146,7 @@ def joint_layout(arm, latent_dim=0):
         blocks = [(_BLOCK_OF[f], ((f, _FIELD_WIDTH[f]),)) for f in URMA_JOINT_ORDER]
     elif arm in NON_LATENT_ARMS:
         blocks = [("K", K_FIELDS), ("D", D_FIELDS), ("G", G_FIELDS)]
-    elif arm in LATENT_ARMS:
+    elif is_latent_arm(arm):
         if latent_dim <= 0:
             raise ValueError(f"arm {arm} needs a latent dim > 0")
         blocks = [("LAT", ((f"{arm}_latent", latent_dim),)), ("D", D_FIELDS), ("G", G_FIELDS)]
@@ -361,8 +380,8 @@ def check_arms_distinct(env, fields, g, st, arm, latent_dir):
     """Startup guard (cf. ModuMorph's silent arm collapse): fail loudly if two arms give the same
     joint inputs for this robot, or if a block an arm switches on is all zeros."""
     mats = {a: assemble_joint_matrix(a, fields, g) for a in NON_LATENT_ARMS}
-    for la in LATENT_ARMS:
-        if la == arm or (latent_dir and latent_path(latent_dir, la, robot_dir_name(env)).is_file()):
+    for la in sorted(set(latent_arms_available(latent_dir, robot_dir_name(env))) | ({arm} if is_latent_arm(arm) else set())):
+        if True:
             mats[la] = assemble_joint_matrix(la, fields, g, limb_latents(latent_dir, la, env, st["body_names"]))
     names = list(mats)
     for i, a in enumerate(names):
@@ -402,7 +421,7 @@ def compute_name_to_description_vector(env, default_qpos_qvel, foot_geom_suffix=
 
     g, feet, joints_geo = _robot_geometry(env, foot_geom_names)
     fields, st = limb_fields(env, dof_idx, jnt_idx, joints_geo)
-    latents = limb_latents(latent_dir, arm, env, st["body_names"]) if arm in LATENT_ARMS else None
+    latents = limb_latents(latent_dir, arm, env, st["body_names"]) if is_latent_arm(arm) else None
     joint_matrix, _ = assemble_joint_matrix(arm, fields, g, latents)
 
     if not getattr(env, "_limb_context_checked", False):

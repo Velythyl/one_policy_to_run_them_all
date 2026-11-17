@@ -3,6 +3,7 @@ becomes one world: pre-state loaded, same action applied, outputs compared.
     python equiv_gpu_check.py <dump_dir> <out_json> robot [robot ...]
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +20,8 @@ for robot in sys.argv[3:]:
     try:
         z = np.load(dump / f"{robot}.npz")
         K = len(z["reward"])
-        env = MJXRobotEnv(load_spec(robot), context_arm="urma", impl="warp", nr_envs_per_type=1)
+        env = MJXRobotEnv(load_spec(robot), context_arm="urma", impl="warp", nr_envs_per_type=1,
+                          solimp_dmax_clamp=float(os.environ.get("SOLIMP_CLAMP", 0)))
         P = env.P
         P["noise"] = {k: 0.0 for k in P["noise"]}
         P["dropout"] = {**P["dropout"], "dynamic_dropout_chance": 0.0}

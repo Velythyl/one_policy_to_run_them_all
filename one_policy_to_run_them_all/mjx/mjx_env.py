@@ -155,6 +155,7 @@ class MJXRobotEnv:
     model_variant: str = "native"  # native | feet_only (contacts only floor vs feet/trunk/hip)
     eval_mode: bool = False  # CPU env.eval: curriculum coefficient 1.0
     contacts_per_env: int = 64
+    solimp_dmax_clamp: float = 0.0  # >0: cap geom solimp dmax (see __post_init__)
 
     def __post_init__(self):
         sp, c = self.spec, self.spec.cfg
@@ -171,6 +172,14 @@ class MJXRobotEnv:
                 if g not in keep:
                     m.geom_contype[g] = 0
                     m.geom_conaffinity[g] = 0
+        if self.solimp_dmax_clamp > 0:
+            # float32 Warp blows up on contacts whose impedance reaches 1 (solimp dmax = 1, e.g. the
+            # go1 / anymal feet "0.015 1 0.031", badger "1.2 1.1" -> clamped to 0.9999 by MuJoCo):
+            # zero constraint regularisation. Cap dmax (and dmin) at solimp_dmax_clamp.
+            hit = m.geom_solimp[:, 1] > self.solimp_dmax_clamp
+            m.geom_solimp[hit, 1] = self.solimp_dmax_clamp
+            m.geom_solimp[:, 0] = np.minimum(m.geom_solimp[:, 0], self.solimp_dmax_clamp)
+            self.solimp_clamped_geoms = np.nonzero(hit)[0].tolist()
         self.mj_model = m
         self.mx = mjx.put_model(m, impl=self.impl)
         self.n = len(c["joint_names"])
@@ -237,7 +246,7 @@ class MJXRobotEnv:
         self.robot_height = float(self.robot_dims[2])
         self.limb_bodies = np.asarray(ctx["limb_bodies"], dtype=int)
         self.latents = None
-        if self.context_arm in lc.LATENT_ARMS:
+        if lc.is_latent_arm(self.context_arm):
             lat = lc.load_latents(self.latent_dir, self.context_arm, sp.name, m)
             self.latents = f64([lat[b] for b in ctx["body_names"]])
         lat_dim = 0 if self.latents is None else self.latents.shape[1]

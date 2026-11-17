@@ -19,7 +19,24 @@ cfg_dir, robot = Path(sys.argv[1]), sys.argv[2]
 B = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
 S = int(sys.argv[4]) if len(sys.argv) > 4 else 300
 c = json.loads((cfg_dir / f"{robot}.json").read_text())
-m = mujoco.MjModel.from_xml_path(os.environ.get("XML", str(ENV_ROOT / robot / "data" / c["xml_file"])))
+_spec = mujoco.MjSpec.from_file(os.environ.get("XML", str(ENV_ROOT / robot / "data" / c["xml_file"])))
+VARIANT = os.environ.get("VARIANT", "")
+_m0 = _spec.compile()
+for _i, _g in enumerate(_spec.geoms):
+    _col = _m0.geom_contype[_i] or _m0.geom_conaffinity[_i]
+    if "condim3" in VARIANT and _m0.geom_condim[_i] == 6:
+        _g.condim = 3
+    if "capsule" in VARIANT and _col and _m0.geom_type[_i] == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        _g.type = mujoco.mjtGeom.mjGEOM_CAPSULE
+        _g.size = [_m0.geom_size[_i, 0], _m0.geom_size[_i, 1], 0]
+    if "clampimp" in VARIANT and _col and _m0.geom_solimp[_i, 1] > 0.99:
+        _si = _m0.geom_solimp[_i].copy(); _si[1] = 0.99; _si[0] = min(_si[0], 0.99); _g.solimp = _si
+    if "solimp" in VARIANT and "clampimp" not in VARIANT and _col:
+        _g.solimp = [0.9, 0.95, 0.001, 0.5, 2]
+if "elliptic" in VARIANT:
+    _spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+m = _spec.compile()
+print("variant", VARIANT, flush=True)
 m.opt.timestep = c["timestep"]
 for k_, v_ in json.loads(os.environ.get("OPT_OVERRIDE", "{}")).items():
     setattr(m.opt, k_, v_)
@@ -79,7 +96,7 @@ for s in range(S):
                 # replace the diverged world by its pre-state so it does not count twice
         if bad.any():
             dw = jax.tree_util.tree_map(lambda a, b: a, dw, dw)  # keep going; diverged worlds stay bad
-print(robot, "opt", os.environ.get("OPT_OVERRIDE", "{}"), "diverged", len(first_bad), "/", B)
+print(robot, "variant", VARIANT, "opt", os.environ.get("OPT_OVERRIDE", "{}"), "diverged", len(first_bad), "/", B)
 nit = np.concatenate(niter_hist)
 print("solver_niter mean %.1f p99 %.0f at_limit %.4f" % (nit.mean(), np.percentile(nit, 99), (nit >= m.opt.iterations).mean()))
 print("contact pairs in blow-up step:", pair_at_blowup.most_common(10))
