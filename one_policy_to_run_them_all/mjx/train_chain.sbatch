@@ -28,8 +28,8 @@ mkdir -p "$OUT"
 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits -l 30 > "$OUT/gpu-${SLURM_JOB_ID}.csv" &
 /network/scratch/c/charlie.gauthier/urma_context/venv_mjx/bin/python \
   $URMA_MJX_CODE/one_policy_to_run_them_all/mjx/train_mjx.py \
-  --max_wall_s "$MAX_WALL_S" "$@"
-rc=$?
+  --max_wall_s "$MAX_WALL_S" "$@" 2>&1 | grep --line-buffered -v -E "solver iterations limit reached|To disable the print warning"
+rc=${PIPESTATUS[0]}  # (Warp prints one iteration-limit warning per step when any world hits 100 Newton iterations)
 echo "EXIT $rc"
 if [ $rc -eq 3 ] && [ ! -e "$OUT/STOP" ] && [ ! -e "$OUT/DONE" ]; then
   sbatch --job-name="$SLURM_JOB_NAME" --partition="$SLURM_JOB_PARTITION" --time="$(squeue -h -j $SLURM_JOB_ID -o %l)" \

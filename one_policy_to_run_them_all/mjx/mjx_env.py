@@ -29,6 +29,36 @@ from flax import struct
 from mujoco import mjx
 
 from one_policy_to_run_them_all.context import limb_context as lc
+
+
+def configure_warp_ffi():
+    """MJX-Warp wraps every mjwarp call in a Warp-captured CUDA graph (GraphMode.WARP) cached per
+    buffer-address set, at most 32 per callable. With 16+ robot types the address sets exceed the
+    cache: graphs are re-captured every call (slow) and each capture holds its own temporaries
+    (OOM on a 40 GB A100 after 4 iterations). Env knobs (set before the first trace):
+      URMA_WARP_GRAPH_MODE = warp | warp_staged_ex | warp_staged | jax | none   (default warp)
+      URMA_WARP_GRAPH_CACHE = max cached graphs per callable                     (default 32)"""
+    import os
+    import warp as wp
+    from mujoco.mjx.warp import ffi as mffi
+    from warp._src.jax import ffi as wffi
+    mode = os.environ.get("URMA_WARP_GRAPH_MODE", "warp").upper()
+    gm = getattr(wp.JaxCallableGraphMode, mode)
+    d = list(mffi.jax_callable_variadic_tuple.__defaults__)
+    d[1] = gm  # (num_outputs, graph_mode, vmap_method, ...)
+    mffi.jax_callable_variadic_tuple.__defaults__ = tuple(d)
+    cache = int(os.environ.get("URMA_WARP_GRAPH_CACHE", 32))
+    import inspect
+    names = [p for p in inspect.signature(wffi.jax_callable).parameters.values() if p.default is not inspect.Parameter.empty]
+    dd = list(wffi.jax_callable.__defaults__)
+    for i, prm in enumerate(names):
+        if prm.name == "graph_cache_max":
+            dd[i] = cache
+    wffi.jax_callable.__defaults__ = tuple(dd)
+    return mode, cache
+
+
+WARP_FFI_CONFIG = configure_warp_ffi()
 from one_policy_to_run_them_all.mjx.robot_spec import RobotSpec
 
 

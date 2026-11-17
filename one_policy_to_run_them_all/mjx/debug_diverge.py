@@ -36,7 +36,11 @@ for _i, _g in enumerate(_spec.geoms):
 if "elliptic" in VARIANT:
     _spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
 m = _spec.compile()
-print("variant", VARIANT, flush=True)
+if os.environ.get("SOLREF"):  # DR writes geom_solref[:, :2] = (-stiffness, -damping) for every geom
+    m.geom_solref[:, :2] = [float(x) for x in os.environ["SOLREF"].split(",")]
+if "clampimp" in VARIANT:  # same as MJXRobotEnv.solimp_dmax_clamp (also dmin), applied to the compiled model
+    m.geom_solimp[:, 1] = np.minimum(m.geom_solimp[:, 1], 0.99); m.geom_solimp[:, 0] = np.minimum(m.geom_solimp[:, 0], 0.99)
+print("variant", VARIANT, "solref", os.environ.get("SOLREF", "xml"), flush=True)
 m.opt.timestep = c["timestep"]
 for k_, v_ in json.loads(os.environ.get("OPT_OVERRIDE", "{}")).items():
     setattr(m.opt, k_, v_)
@@ -96,7 +100,7 @@ for s in range(S):
                 # replace the diverged world by its pre-state so it does not count twice
         if bad.any():
             dw = jax.tree_util.tree_map(lambda a, b: a, dw, dw)  # keep going; diverged worlds stay bad
-print(robot, "variant", VARIANT, "opt", os.environ.get("OPT_OVERRIDE", "{}"), "diverged", len(first_bad), "/", B)
+print(robot, "variant", VARIANT, "solref", os.environ.get("SOLREF", "xml"), "opt", os.environ.get("OPT_OVERRIDE", "{}"), "diverged", len(first_bad), "/", B)
 nit = np.concatenate(niter_hist)
 print("solver_niter mean %.1f p99 %.0f at_limit %.4f" % (nit.mean(), np.percentile(nit, 99), (nit >= m.opt.iterations).mean()))
 print("contact pairs in blow-up step:", pair_at_blowup.most_common(10))
