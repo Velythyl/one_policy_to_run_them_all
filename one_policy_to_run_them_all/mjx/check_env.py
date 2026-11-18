@@ -5,18 +5,31 @@ import numpy as np
 import jax, jax.numpy as jnp
 from one_policy_to_run_them_all.mjx.robot_spec import load_spec
 from one_policy_to_run_them_all.mjx.mjx_env import MJXRobotEnv
+from one_policy_to_run_them_all.context import limb_context as lc
+
+LATENTS_DUMMY = "/network/scratch/c/charlie.gauthier/urma_context/latents_dummy"  # the latents extract_robot_config.py used
 
 impl = sys.argv[1] if len(sys.argv) > 1 else "jax"
 robots = sys.argv[2:] or ["unitree_go1", "unitree_h1", "hexapod"]
 for r in robots:
     sp = load_spec(r)
-    for arm in ("urma", "dk", "k", "d", "empty"):
-        env = MJXRobotEnv(sp, context_arm=arm, impl=impl) if arm == "urma" else env.__class__(sp, context_arm=arm, impl=impl)
+    arms = ("urma",) + tuple(a for a in sp.cfg["cpu_descriptions"] if a != "urma")  # urma, dk, k, d, empty + dummy-latent arms
+    stock_j = stock_f = None
+    for arm in arms:
+        env = MJXRobotEnv(sp, context_arm=arm, impl=impl, latent_dir=LATENTS_DUMMY if lc.is_latent_arm(arm) else "")
         jd, fd, _ = env.descriptions(env.init_dr)
+        jd, fd = np.asarray(jd), np.asarray(fd)
         cj = np.asarray(sp.cfg["cpu_descriptions"][arm]["joints"]); cf = np.asarray(sp.cfg["cpu_descriptions"][arm]["feet"])
-        ej, ef = np.abs(np.asarray(jd) - cj).max(), np.abs(np.asarray(fd) - cf).max()
+        assert jd.shape == cj.shape and fd.shape == cf.shape, (r, arm, jd.shape, cj.shape)
+        ej, ef = np.abs(jd - cj).max(), np.abs(fd - cf).max()
         assert ej < 1e-5 and ef < 1e-5, (r, arm, ej, ef)
-    print(r, "descriptions match CPU for all arms", flush=True)
+        if arm == "urma":
+            stock_j, stock_f = jd, fd
+        elif arm == "empty":
+            assert not np.any(jd) and not np.any(fd), (r, "empty not all zero")
+        else:  # stock_superset_v2: GPU STOCK prefix == GPU urma token exactly
+            assert np.array_equal(jd[:, :lc.STOCK_WIDTH], stock_j) and np.array_equal(fd, stock_f), (r, arm, "STOCK prefix")
+    print(r, "descriptions match CPU for all arms:", " ".join(f"{a}" for a in arms), flush=True)
     B = 4
     env = MJXRobotEnv(sp, context_arm="dk", impl=impl, nr_envs_per_type=B)
     t = time.time()
@@ -33,6 +46,6 @@ for r in robots:
     keys = jax.random.split(jax.random.PRNGKey(1), B)
     dr2 = jax.vmap(env._sample_dr)(keys, st.dr)
     jd2 = jax.vmap(lambda d: env.descriptions(d)[0])(dr2)
-    tl = env.layout.field_slice("gear")
+    tl = env.layout.field_slice("urma_torque_limit")
     assert not np.allclose(np.asarray(jd2[0, :, tl]), np.asarray(jd2[1, :, tl])), "D not per-env"
     print(r, "per-env D follows DR ok", flush=True)

@@ -367,6 +367,9 @@ class MJXRobotEnv:
             self.latents = f64([lat[b] for b in ctx["body_names"]])
         lat_dim = 0 if self.latents is None else self.latents.shape[1]
         self.layout = lc.joint_layout(self.context_arm, lat_dim)
+        self.stock_layout = lc.stock_layout()
+        self.extras_layout = lc.extras_layout(self.context_arm, lat_dim)
+        assert self.layout.columns == self.stock_layout.columns + self.extras_layout.columns, self.context_arm
         self.on = lc.ARM_BLOCKS_ON[self.context_arm]
         self.joint_desc_size = self.layout.width
         self.foot_desc_size = 10
@@ -575,22 +578,26 @@ class MJXRobotEnv:
             "robot_mass": jnp.reshape(mass / (170.0 / 2) - 1.0, (1,)),
             "robot_dims": jnp.asarray(self.robot_dims / (2.0 / 2) - 1.0, jnp.float32),
         }
-        cols = []
-        for block, name, s, e in self.layout.columns:
-            if block not in self.on:
-                cols.append(jnp.zeros((self.n, e - s)))
-            elif block == "G":
-                cols.append(jnp.broadcast_to(g[name], (self.n, e - s)))
-            elif block == "LAT":
-                cols.append(jnp.asarray(self.latents, jnp.float32))
-            else:
-                cols.append(f[name])
-        jd = jnp.concatenate(cols, axis=-1)
+        def fill(columns, on):
+            cols = []
+            for block, name, s, e in columns:
+                if block not in on:
+                    cols.append(jnp.zeros((self.n, e - s)))
+                elif block == "G":
+                    cols.append(jnp.broadcast_to(g[name], (self.n, e - s)))
+                elif block == "LAT":
+                    cols.append(jnp.asarray(self.latents, jnp.float32))
+                else:
+                    cols.append(f[name])
+            return cols
+        # context stock_superset_v2: [STOCK 23 (= the urma arm's token, same code; zeros in empty) | arm extras]
+        jd = jnp.concatenate(fill(self.stock_layout.columns, self.on) + fill(self.extras_layout.columns, self.on), axis=-1)
         gvec = jnp.concatenate([g["p_d_gain_scaling"], g["robot_mass"], g["robot_dims"]])
         feet_pos = jnp.asarray(self.ctx_feet, jnp.float32)
-        if "K" not in self.on:
+        foot_pos_on, foot_g_on = lc.foot_blocks_on(self.context_arm)
+        if not foot_pos_on:
             feet_pos = jnp.zeros_like(feet_pos)
-        if "G" not in self.on:
+        if not foot_g_on:
             fg = jnp.zeros((self.nf, 7))
         else:
             fg = jnp.broadcast_to(gvec, (self.nf, 7))

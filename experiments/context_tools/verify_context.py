@@ -1,18 +1,21 @@
-"""Verify the per-limb context arms on every robot (real envs, no pytest).
+"""Verify the per-limb context arms (context version stock_superset_v2) on every robot (real envs, no pytest).
 
     python verify_context.py <stock_npz> <latent_dir> [out_npz]
 
 For every robot x arm (default pose and 3 DR samples, seed 0):
-  * widths: equal within an arm family across all robots; foot width 10 everywhere
-  * K / D / LAT / G column sets disjoint; switched-off blocks exactly zero
-  * empty: joint AND foot tokens all zero (G copies zeroed too); other arms keep G
-  * latent arms (every <latent_dir>/<arm>/ dir: vme, vmestar, matme, vme_sa, vmestar_sa, ...): only latent + D (+ G) columns non-zero; latent equals the file's latent
-  * urma arm == stock (bitwise), dk/k/d/latent G == stock G, feet == stock,
-    D link fields recomputed after DR (seen values), and urma arm == stock
-  * no two arms identical for a robot
-Prints the field tables for unitree_a1 and atlas.
+  * urma arm == stock (bitwise, joints and feet, every sample)
+  * every arm except empty: joint token[:, :23] == urma arm's joint token (bitwise, every sample);
+    foot token == stock foot token (bitwise)
+  * empty: joint AND foot tokens all zero, width 23
+  * extras (columns 23:) = exactly the arm's extras layout; every extras field present (not all zero) per robot;
+    latent columns == the latent file; body_mass / K fields / body_parent vary across limbs (pooled over robots)
+  * joint width constant per arm across robots
+  * no two arms identical for a robot (full token; and extras of equal-width arms differ)
+Prints the field table for unitree_a1 and atlas.
 """
 import sys
+from pathlib import Path
+
 import numpy as np
 from envs import build_env, ALL_ROBOTS
 from one_policy_to_run_them_all.context import limb_context as lc
@@ -20,11 +23,12 @@ from one_policy_to_run_them_all.context import limb_context as lc
 stock = np.load(sys.argv[1])
 latent_dir = sys.argv[2]
 out = sys.argv[3] if len(sys.argv) > 3 else None
-ARMS = ("urma",) + lc.NON_LATENT_ARMS + tuple(sorted(p.name for p in __import__("pathlib").Path(latent_dir).iterdir() if p.is_dir() and lc.is_latent_arm(p.name)))
-LAT_ARMS = [a for a in ARMS if lc.is_latent_arm(a)]
-dump = {}
-widths = {}
-stock_layout = lc.joint_layout("urma")
+LAT_ARMS = tuple(sorted(p.name for p in Path(latent_dir).iterdir() if p.is_dir() and lc.is_latent_arm(p.name)))
+ARMS = ("urma",) + lc.NON_LATENT_ARMS + LAT_ARMS
+SW = lc.STOCK_WIDTH
+assert SW == 23 and lc.stock_layout().width == 23
+dump, widths = {}, {}
+pooled = {}  # (arm, field) -> list of per-limb rows (default sample), for the variation check
 
 
 def descr(env):
@@ -40,23 +44,22 @@ def dr_sample(env):
 
 
 def print_table(robot, env, mats):
-    print(f"\n=== {robot}: joint-token field table (limb 0 = {env.joint_names[0]} / body {env._limb_context_static['body_names'][0]}) ===")
-    lay = lc.joint_layout("dk")
-    print(f"{'block':5s} {'field':16s} {'cols(dk)':9s} " + " ".join(f"{a:>7s}" for a in ("dk", "k", "d", "empty")) + "   dk value(s) limb 0")
-    for block, f, s, e in lay.columns:
-        on = " ".join(f"{'x' if block in lc.ARM_BLOCKS_ON[a] else '.':>7s}" for a in ("dk", "k", "d", "empty"))
-        vals = np.array2string(mats["dk"][0][0, s:e], precision=3, suppress_small=True, max_line_width=200)
-        print(f"{block:5s} {f:16s} {s:3d}:{e:<5d} {on}   {vals}")
-    for la in LAT_ARMS:
-        ll = lc.joint_layout(la, mats[la][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH)
-        print(f"{la}: " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in ll.columns if b != "D"))
-    print(f"foot token (all arms): " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in lc.FOOT_LAYOUT.columns)
-          + "; foot_pos zeroed in arms without K")
+    print(f"\n=== {robot}: joint-token layout (context {lc.CONTEXT_VERSION}; limb 0 = {env.joint_names[0]}) ===")
+    for a in ARMS:
+        J = mats[a][0]
+        lay = lc.joint_layout(a, lc.latent_dim_from_width(a, J.shape[1]))
+        print(f"-- {a}: width {lay.width}, foot 10" + (" (all zeros)" if a == "empty" else ""))
+        if a in ("dk", "urma") or lc.is_latent_arm(a) and a == LAT_ARMS[0]:
+            for block, f, s, e in lay.columns:
+                vals = np.array2string(J[0, s:e], precision=3, suppress_small=True, max_line_width=200)
+                print(f"   {block:3s} {f:22s} {s:3d}:{e:<3d} {vals}")
+        else:
+            print("   " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in lay.columns if s >= SW) or "   (no extras)")
+    print("foot token: " + ", ".join(f"{b}:{f}[{s}:{e}]" for b, f, s, e in lc.FOOT_LAYOUT.columns) + "; zero only in empty")
 
 
 for robot in ALL_ROBOTS:
-    mats = {}
-    envs = {}
+    mats, envs = {}, {}
     for arm in ARMS:
         env = build_env(robot, seed=0, context_arm=arm, latent_dir=latent_dir)
         env.multi_robot_max_observation_size = -1
@@ -69,84 +72,74 @@ for robot in ALL_ROBOTS:
         for s_i, (J, F) in enumerate(per_sample):
             dump[f"{robot}/{arm}/{s_i}/joints"] = J
             dump[f"{robot}/{arm}/{s_i}/feet"] = F
-        widths.setdefault(arm, set()).add((J.shape[1], F.shape[1]))
-        assert F.shape[1] == 10, (robot, arm, F.shape)
+        widths.setdefault(arm, set()).add(J.shape[1])
+        assert all(F.shape[1] == 10 for _, F in per_sample), (robot, arm)
+        assert env.dynamic_joint_description_size == J.shape[1], (robot, arm)
 
-    # stock reproduction: urma arm bitwise, dk restricted to URMA fields bitwise, every sample
+    names = envs["urma"][0].joint_names
+    feet = envs["urma"][0].foot_names
     for s_i in range(4):
-        Js = np.stack([stock[f"{robot}/{s_i}/{j}"] for j in envs["urma"][0].joint_names])
-        Fs = np.stack([stock[f"{robot}/{s_i}/{f}"] for f in envs["urma"][0].foot_names])
+        Js = np.stack([stock[f"{robot}/{s_i}/{j}"] for j in names])
+        Fs = np.stack([stock[f"{robot}/{s_i}/{f}"] for f in feet])
         Ju, Fu = envs["urma"][1][s_i]
-        assert np.array_equal(Ju, Js) and np.array_equal(Fu, Fs), (robot, "urma != stock", s_i)
-        Jdk, Fdk = envs["dk"][1][s_i]
-        assert np.array_equal(Fdk, Fs), (robot, s_i, "dk feet != stock")
-        dk_lay = lc.joint_layout("dk")
-        for _, f, s, e in stock_layout.columns:
-            if f in dict(lc.G_FIELDS):
-                assert np.array_equal(Jdk[:, dk_lay.field_slice(f)], Js[:, s:e]), (robot, s_i, f, "dk G != stock")
+        assert Ju.shape[1] == SW and np.array_equal(Ju, Js) and np.array_equal(Fu, Fs), (robot, "urma != stock", s_i)
+        for arm in ARMS:
+            J, F = envs[arm][1][s_i]
+            if arm == "empty":
+                assert J.shape[1] == SW and not np.any(J) and not np.any(F), (robot, s_i, "empty not all zero")
+                continue
+            assert np.array_equal(J[:, :SW], Ju), (robot, arm, s_i, "STOCK prefix != urma token")
+            assert np.array_equal(F, Fs), (robot, arm, s_i, "foot token != stock")
 
-    # D recomputed under DR: torque limit (always resampled) must change across samples
-    dk_lay = lc.joint_layout("dk")
-    tl = [envs["dk"][1][s][0][:, dk_lay.field_slice("gear")] for s in range(4)]
-    assert not np.array_equal(tl[0], tl[1]), (robot, "D not recomputed after DR")
+    # STOCK D fields recomputed under DR (torque limit always resampled)
+    tl = lc.stock_layout().field_slice("urma_torque_limit")
+    assert not np.array_equal(envs["urma"][1][0][0][:, tl], envs["urma"][1][1][0][:, tl]), (robot, "D not recomputed after DR")
 
-    for arm in ARMS:
-        if arm == "urma":
-            continue
-        env, per_sample = envs[arm]
-        latent_dim = per_sample[0][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
-        lay = lc.joint_layout(arm, latent_dim)
-        blocks = {b: set(lay.block_columns(b).tolist()) for b in ("K", "D", "P", "LAT", "G")}
-        allc = [c for b in blocks.values() for c in b]
-        assert len(allc) == len(set(allc)) == lay.width, (robot, arm, "blocks not disjoint / not covering")
-        for J, F in per_sample:
-            for b, cols in blocks.items():
-                if not cols:
-                    continue
-                sub = J[:, sorted(cols)]
-                if b in lc.ARM_BLOCKS_ON[arm]:
-                    assert np.any(sub), (robot, arm, b, "switched-on block is zero")
-                else:
-                    assert not np.any(sub), (robot, arm, b, "switched-off block non-zero")
-            if "K" not in lc.ARM_BLOCKS_ON[arm]:
-                assert not np.any(F[:, :3]), (robot, arm, "foot pos must be zero without K")
-            if "G" not in lc.ARM_BLOCKS_ON[arm]:
-                assert not np.any(F[:, 3:]), (robot, arm, "foot G must be zero")
-            else:
-                assert np.any(F[:, 3:]), (robot, arm, "foot G missing")
-        if arm == "empty":
-            for J, F in per_sample:
-                assert not np.any(J) and not np.any(F), (robot, "empty tokens not all zero")
-        if lc.is_latent_arm(arm):
-            lat = lc.load_latents(latent_dir, arm, lc.robot_dir_name(env), env.model)
-            want = np.stack([lat[b] for b in env._limb_context_static["body_names"]])
-            assert np.array_equal(per_sample[0][0][:, lay.block_columns("LAT")], want), (robot, arm, "latent mismatch")
-    # G columns identical across arms (default sample) and equal to stock's
-    Js = np.stack([stock[f"{robot}/0/{j}"] for j in envs["urma"][0].joint_names])
-    g_stock = Js[:, stock_layout.block_columns("G")]
     for arm in ARMS:
         if arm in ("urma", "empty"):
             continue
-        lat_dim = mats[arm][0].shape[1] - lc.D_WIDTH - lc.P_WIDTH - lc.G_WIDTH if lc.is_latent_arm(arm) else 0
-        assert np.array_equal(mats[arm][0][:, lc.joint_layout(arm, lat_dim).block_columns("G")], g_stock), (robot, arm, "G differs")
-    # no two arms identical
+        env, per_sample = envs[arm]
+        J0 = per_sample[0][0]
+        lay = lc.joint_layout(arm, lc.latent_dim_from_width(arm, J0.shape[1]))
+        ext = lc.extras_layout(arm, lc.latent_dim_from_width(arm, J0.shape[1]))
+        assert lay.width == J0.shape[1] and ext.columns and ext.columns[0][2] == SW and ext.width == lay.width, (robot, arm)
+        assert lay.columns[:len(lc.stock_layout().columns)] == lc.stock_layout().columns, (robot, arm, "stock layout prefix")
+        for block, f, s, e in ext.columns:
+            for J, _ in per_sample:
+                assert np.all(np.isfinite(J[:, s:e])), (robot, arm, f, "non-finite")
+                assert np.any(J[:, s:e]), (robot, arm, f, "extras field all zero")
+            pooled.setdefault((arm, f), []).append(J0[:, s:e])
+        if lc.is_latent_arm(arm):
+            lat = lc.load_latents(latent_dir, arm, lc.robot_dir_name(env), env.model)
+            want = np.stack([lat[b] for b in env._limb_context_static["body_names"]])
+            assert np.array_equal(J0[:, ext.block_columns("LAT")], want), (robot, arm, "latent mismatch")
+        expect = {"d": {"D", "P"}, "k": {"K", "P"}, "dk": {"K", "D", "P"}}.get(arm, {"LAT", "P"})
+        assert {b for b, *_ in ext.columns} == expect, (robot, arm, "extras blocks")
+
+    # no two arms identical (full token), and equal-width arms differ in their extras
     for i, a in enumerate(ARMS):
         for b in ARMS[i + 1:]:
-            assert not (mats[a][0].shape == mats[b][0].shape and np.array_equal(mats[a][0], mats[b][0])), (robot, a, b, "identical")
-    n = len(envs["dk"][0].joint_names)
+            A, B = mats[a][0], mats[b][0]
+            if A.shape == B.shape:
+                assert not np.array_equal(A, B), (robot, a, b, "identical")
+                if a not in ("urma", "empty") and b not in ("urma", "empty"):
+                    assert not np.array_equal(A[:, SW:], B[:, SW:]), (robot, a, b, "identical extras")
+    n = len(names)
     print(f"{robot:14s} OK  limbs={n:2d}  widths " + " ".join(f"{a}={mats[a][0].shape[1]}" for a in ARMS), flush=True)
     if robot in ("unitree_a1", "atlas"):
-        print_table(robot, envs["dk"][0], mats)
+        print_table(robot, envs["urma"][0], mats)
     for env, _ in envs.values():
         env.close()
 
 for arm, w in widths.items():
     assert len(w) == 1, (arm, "width differs across robots", w)
-fam = {widths[a].copy().pop()[0] for a in lc.NON_LATENT_ARMS}
-assert len(fam) == 1, ("non-latent family widths differ", fam)
-fam = {widths[a].copy().pop()[0] for a in LAT_ARMS}
-assert len(fam) == 1, ("latent family widths differ", fam)
-print("\nALL CHECKS PASSED; joint widths:", {a: widths[a].copy().pop()[0] for a in ARMS})
+print("\nextras field statistics over all limbs of all robots (default sample):")
+for (arm, f), rows in sorted(pooled.items()):
+    X = np.concatenate(rows)
+    std = X.std(0)
+    print(f"  {arm:11s} {f:22s} n={len(X):3d} min {X.min():+.3f} max {X.max():+.3f} per-col std {np.array2string(std, precision=3, max_line_width=200)}")
+    assert np.all(np.isfinite(X)) and std.max() > 1e-3, (arm, f, "degenerate (constant over all limbs)")
+print(f"\nALL CHECKS PASSED (context {lc.CONTEXT_VERSION}); joint widths:", {a: widths[a].copy().pop() for a in ARMS})
 if out:
     np.savez_compressed(out, **dump)
     print("dumped", out)

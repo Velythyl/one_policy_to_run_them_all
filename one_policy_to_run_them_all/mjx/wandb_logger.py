@@ -29,6 +29,8 @@ from pathlib import Path
 
 import numpy as np
 
+from one_policy_to_run_them_all.context import limb_context as lc
+
 DEFAULT_ENTITY = "velythyl"
 DEFAULT_PROJECT = "urma_context"
 
@@ -38,7 +40,12 @@ _FIX_VMESTAR = "MODEL.VMA.CHECK_PATH resnet_new_decoder-L16-WTrue-notest_TargetO
 _FIX_MATME = "MODEL.VMA.CHECK_PATH 1dcnn_autoencoder_BodyOnly  MODEL.VMA.LATENT_DIR /tmp/vmalatentdir"  # (double space as in ModuMorph)
 
 # arm -> (vma.add_gt_bodies, vma.add_vma_latents, vma.add_nonbodyinfo, vma.delete_context, fixargs.fixargs, fixargs.ablation)
-# mirrors the ModuMorph PRETTY_NAME it corresponds to ("D (ModuM)" -> "D (URMA)", ...)
+# mirrors the ModuMorph PRETTY_NAME it corresponds to ("D (ModuM)" -> "D (URMA)", ...). These keys only name the
+# arm (unchanged across context versions, so ModuMorph's selectors keep working per arm). WHICH context the arm
+# carried is urma.context_version (+ meta.tags): "stock_superset_v2" (2026-11-18 on: every arm except empty =
+# [stock URMA 23 | extras], see limb_context.py) vs runs without the key = "modumorph_v1" (campaign 1, frozen
+# 895fbb5: [K | D | P | G] / [latent | D | P | G], stock fields dropped). Filter on urma.context_version to
+# separate the two campaigns. urma.context_layout records the exact joint-token columns.
 ARM_COMPAT = {
     "dk":         (True,  False, None,  None, _FIX_PLAIN,   "Segmented"),       # D+K
     "d":          (False, False, None,  None, _FIX_PLAIN,   "Segmented"),       # D
@@ -93,6 +100,25 @@ def latent_meta(latent_dir, arm):
         return {"error": repr(e)[:200]}
 
 
+def context_layout(arm, latent_dir, robots):
+    """Joint-token layout of this arm as [[block, field, start, stop], ...] (+ widths)."""
+    lat_dim = 0
+    if lc.is_latent_arm(arm):
+        for r in robots:
+            try:
+                lat = json.loads((Path(latent_dir) / arm / f"{r}.json").read_text())
+                lat_dim = len(next(iter(lat.values())))
+                break
+            except Exception:
+                continue
+    try:
+        lay = lc.joint_layout(arm, lat_dim)
+    except Exception as e:
+        return {"error": repr(e)[:200]}
+    return {"joint_width": lay.width, "stock_width": lc.STOCK_WIDTH, "foot_width": lc.FOOT_LAYOUT.width,
+            "joint_columns": [list(c) for c in lay.columns], "all_zero": arm == "empty"}
+
+
 def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_iter, nr_iters, code_dir, run_name):
     arm = a.context_arm
     gt, lat, nonbody, delete, fix, abl = ARM_COMPAT.get(arm, (None, None, None, None, f"URMA_ARM {arm}", f"URMA_{arm}"))
@@ -110,8 +136,11 @@ def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_it
         "dataset": {"dataset_name": "urma", "train_robots": list(robots), "eval_robots": list(eval_robots)},
         "meta": {"project": os.environ.get("URMA_WANDB_PROJECT", DEFAULT_PROJECT), "run_name": run_name, "seed": a.seed,
                  "config_name": f"urma_mjx_{task}", "HYDRA_SWEEP_DIR": str(Path(a.out).resolve()),
-                 "SLURM_JOB_ID": job, "wandb_mode": os.environ.get("WANDB_MODE", "online"), "tags": ["urma_mjx", arm]},
-        "urma": {"context_arm": arm, "pretty_arm": PRETTY.get(arm, arm), "stock_context": arm == "urma",
+                 "SLURM_JOB_ID": job, "wandb_mode": os.environ.get("WANDB_MODE", "online"),
+                 "tags": ["urma_mjx", arm, lc.CONTEXT_VERSION]},
+        "urma": {"context_arm": arm, "context_version": lc.CONTEXT_VERSION, "pretty_arm": PRETTY.get(arm, arm),
+                 "stock_context": arm == "urma", "stock_superset": arm != "empty",
+                 "context_layout": context_layout(arm, a.latent_dir, robots),
                  "args": vars(a), "git_commit": commit, "git_dirty": dirty, "code_dir": str(code_dir),
                  "cfg_dir": os.environ.get("URMA_MJX_CFG", ""), "latent_dir": a.latent_dir,
                  "latent_meta": latent_meta(a.latent_dir, arm), "recipe_deviations_gpu": deviations,
