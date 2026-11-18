@@ -5,28 +5,36 @@ A limb is a joint plus its child body (the body the joint is attached to in MuJo
 ``environment.py::get_name_to_description_vector`` calls :func:`compute_name_to_description_vector`;
 nothing here is robot specific.
 
-Arms (``environment.context_arm``)
-----------------------------------
-``urma``   stock URMA description, bit-identical to upstream 7c18194 (default; 23 / 10 wide).
-``dk``     [K | D | G]                     non-latent family, 48 wide (K 31: capsule limb shape since 2026-11-17)
-``k``      [K | 0 | G]                     non-latent family
-``d``      [0 | D | G]                     non-latent family
-``empty``  [0 | 0 | 0]                     non-latent family: the whole token is zeros
-``vme``    [VME latent | D | G]            latent family, L + 17 wide
-``vmestar`` [VME* (fine-tuned VME) latent | D | G]  latent family
-``matme``  [MatME latent | D | G]          latent family
+Context version ``stock_superset_v2`` (user decision 2026-11-18): every arm except ``empty`` is a
+STRICT SUPERSET of stock URMA's context. Joint token = [STOCK (23) | arm extras]; the stock 23 columns
+are produced by the very same code as the ``urma`` arm (``assemble_joint_matrix`` builds the urma matrix
+and asserts the prefix is identical).
 
-Within a family every arm has the same width, so the policy / critic networks are identical
-(same parameter shapes); masked blocks are zeros.
+Arms (``environment.context_arm``)            joint width
+------------------------------------------------------------
+``urma``   [STOCK]                                    23   bit-identical to upstream 7c18194 (default)
+``d``      [STOCK | body_mass | body_parent]          25
+``k``      [STOCK | K (16) | body_parent]             40
+``dk``     [STOCK | K (16) | body_mass | body_parent] 41
+``<lat>``  [STOCK | latent (L) | body_parent]         24 + L (40 for the 16-d vme_sa / vmestar_sa / matme; any
+                                                      <latent_dir>/<arm>/ dir is a latent arm)
+``empty``  [0 x 23]                                   23   all zeros (no context, no joint IDs)
 
-G = the robot-global copies URMA appends to every token (p_gain, d_gain, action_scaling_factor,
-total mass, length/width/height). They stay in the tokens of every arm EXCEPT ``empty`` (user
-decision 2026-11-16): ``empty`` joint and foot descriptions are literally all zeros, so all tokens of
-a robot are identical (the honest no-context baseline, no joint IDs). State observations and the
-robot-global fields in ``general_state`` are untouched in every arm.
+STOCK = URMA's stock joint token in URMA's order and normalisation (trunk-frame joint position (3), trunk-frame
+joint axis (3), child-joint count, nominal position, torque limit, max joint velocity, damping, armature,
+stiffness, frictionloss, joint range (2), then the robot-global copies G (7) = p_gain, d_gain,
+action_scaling_factor, total mass, length/width/height).
+Extras use ModuMorph's min-max normalisation with modumorph_bounds.json:
+K = body_pos (3), body_ipos (3), body_iquat (4), geom_quat (4, fitted limb capsule), body_shape (2, capsule
+radius / half length); D extra = body_mass (1, seen DR link mass); P = body_parent (1).
+ModuMorph D fields NOT used (already in STOCK in some form, or degenerate): joint_range, gear (= torque limit),
+max_joint_vel, damping, armature, stiffness, frictionloss, nominal_pos (duplicates); jnt_pos (constant 0 on all
+20 robots); child-frame joint_axis (frame-convention artefact; STOCK has the trunk-frame axis).
 
-Foot tokens always keep URMA's shape: [foot position (3) | G (7)]. Foot position is kinematics,
-so it is zeroed in every arm without K (``empty``, ``d``, ``vme``, ``vmestar``, ``matme``); G is zeroed in ``empty``.
+Foot tokens: stock [trunk-frame foot position (3) | G (7)] in every arm except ``empty`` (all zeros). No
+foot latent. State observations and ``general_state`` are untouched in every arm.
+(The pre-2026-11-18 ModuMorph-style layouts [K | D | P | G] / [latent | D | P | G], which dropped stock
+fields, were context version ``modumorph_v1``; campaign 1 used them.)
 
 D values use URMA's domain-randomised "seen" values (``seen_body_mass``, ``seen_joint_*``) and are
 recomputed whenever ``handle_domain_randomization`` resamples the robot (it calls
@@ -42,6 +50,7 @@ import mujoco
 import numpy as np
 
 
+CONTEXT_VERSION = "stock_superset_v2"
 NON_LATENT_ARMS = ("dk", "k", "d", "empty")
 LATENT_ARMS = ("vme", "vmestar", "matme", "vme_sa", "vmestar_sa")
 ALL_ARMS = ("urma",) + NON_LATENT_ARMS + LATENT_ARMS
@@ -86,8 +95,10 @@ D_FIELDS = (
     ("nominal_pos", 1),        # URMA addition: seen nominal joint position
 )
 P_FIELDS = (("body_parent", 1),)  # parent limb index (trunk = -1 -> 0 .. ), ModuMorph body_parent; all arms but empty
+# stock_superset_v2 extras (appended after the 23 stock columns)
+D_EXTRA_FIELDS = (("body_mass", 1),)  # the only ModuMorph D field not already in STOCK (see module docstring)
 G_FIELDS = (("p_d_gain_scaling", 3), ("robot_mass", 1), ("robot_dims", 3))
-# stock URMA joint-token fields (urma arm only; URMA's own normalisation, bit-exact with upstream)
+# stock URMA joint-token fields (STOCK prefix of every arm but empty; URMA's own normalisation, bit-exact with upstream)
 URMA_FIELDS = (("urma_joint_pos", 3), ("urma_joint_axis", 3), ("urma_nr_child_joints", 1), ("urma_nominal_pos", 1),
                ("urma_torque_limit", 1), ("urma_max_joint_vel", 1), ("urma_damping", 1), ("urma_armature", 1),
                ("urma_stiffness", 1), ("urma_frictionloss", 1), ("urma_joint_range", 2))
@@ -118,8 +129,6 @@ URMA_JOINT_ORDER = (
     "urma_torque_limit", "urma_max_joint_vel", "urma_damping", "urma_armature", "urma_stiffness", "urma_frictionloss",
     "urma_joint_range", "p_d_gain_scaling", "robot_mass", "robot_dims",
 )
-_URMA_BLOCK = {"urma_joint_pos": "K", "urma_joint_axis": "K", "urma_nr_child_joints": "K", "urma_nominal_pos": "K",
-               "urma_joint_range": "K"}
 
 
 def _width(fields):
@@ -127,19 +136,22 @@ def _width(fields):
 
 
 K_WIDTH, D_WIDTH, P_WIDTH, G_WIDTH = _width(K_FIELDS), _width(D_FIELDS), _width(P_FIELDS), _width(G_FIELDS)
-_BLOCK_OF = ({f: _URMA_BLOCK.get(f, "D") for f, _ in URMA_FIELDS} | {f: "K" for f, _ in K_FIELDS}
+STOCK_WIDTH = _width(URMA_FIELDS) + G_WIDTH  # 23
+# block "S" = stock URMA per-joint fields, "G" = stock robot-global copies; together the 23 STOCK columns
+_BLOCK_OF = ({f: "S" for f, _ in URMA_FIELDS} | {f: "K" for f, _ in K_FIELDS}
              | {f: "D" for f, _ in D_FIELDS} | {f: "P" for f, _ in P_FIELDS} | {f: "G" for f, _ in G_FIELDS})
 _FIELD_WIDTH = dict(URMA_FIELDS + K_FIELDS + D_FIELDS + P_FIELDS + G_FIELDS)
 
 class _ArmBlocks(dict):
     def __missing__(self, arm):
         if is_latent_arm(arm):
-            return {"LAT", "D", "P", "G"}
+            return {"S", "G", "LAT", "P"}
         raise KeyError(arm)
 
 
 ARM_BLOCKS_ON = _ArmBlocks({
-    "urma": {"K", "D", "G"}, "dk": {"K", "D", "P", "G"}, "k": {"K", "P", "G"}, "d": {"D", "P", "G"}, "empty": set(),
+    "urma": {"S", "G"}, "dk": {"S", "G", "K", "D", "P"}, "k": {"S", "G", "K", "P"}, "d": {"S", "G", "D", "P"},
+    "empty": set(),
 })
 
 
@@ -161,26 +173,57 @@ class Layout:
         raise KeyError(field)
 
 
-def joint_layout(arm, latent_dim=0):
-    if arm == "urma":
-        blocks = [(_BLOCK_OF[f], ((f, _FIELD_WIDTH[f]),)) for f in URMA_JOINT_ORDER]
-    elif arm in NON_LATENT_ARMS:
-        blocks = [("K", K_FIELDS), ("D", D_FIELDS), ("P", P_FIELDS), ("G", G_FIELDS)]
-    elif is_latent_arm(arm):
-        if latent_dim <= 0:
-            raise ValueError(f"arm {arm} needs a latent dim > 0")
-        blocks = [("LAT", ((f"{arm}_latent", latent_dim),)), ("D", D_FIELDS), ("P", P_FIELDS), ("G", G_FIELDS)]
-    else:
-        raise ValueError(f"unknown context_arm {arm!r}; expected one of {ALL_ARMS}")
-    columns, start = [], 0
+def _make_layout(name, blocks, start=0):
+    columns = []
     for block, fields in blocks:
         for f, w in fields:
             columns.append((block, f, start, start + w))
             start += w
-    return Layout(arm, tuple(columns), start)
+    return Layout(name, tuple(columns), start)
 
 
-FOOT_LAYOUT = Layout("foot", (("K", "foot_pos", 0, 3), ("G", "p_d_gain_scaling", 3, 6),
+def stock_layout():
+    """The 23 STOCK columns (urma arm), URMA's order."""
+    return _make_layout("urma", [(_BLOCK_OF[f], ((f, _FIELD_WIDTH[f]),)) for f in URMA_JOINT_ORDER])
+
+
+def extras_layout(arm, latent_dim=0):
+    """Columns an arm appends after the 23 STOCK columns (start = STOCK_WIDTH); empty for urma / empty."""
+    if arm in ("urma", "empty"):
+        blocks = []
+    elif arm == "d":
+        blocks = [("D", D_EXTRA_FIELDS), ("P", P_FIELDS)]
+    elif arm == "k":
+        blocks = [("K", K_FIELDS), ("P", P_FIELDS)]
+    elif arm == "dk":
+        blocks = [("K", K_FIELDS), ("D", D_EXTRA_FIELDS), ("P", P_FIELDS)]
+    elif is_latent_arm(arm):
+        if latent_dim <= 0:
+            raise ValueError(f"arm {arm} needs a latent dim > 0")
+        blocks = [("LAT", ((f"{arm}_latent", latent_dim),)), ("P", P_FIELDS)]
+    else:
+        raise ValueError(f"unknown context_arm {arm!r}; expected one of {ALL_ARMS}")
+    return _make_layout(arm, blocks, STOCK_WIDTH)
+
+
+def joint_layout(arm, latent_dim=0):
+    """Full joint-token layout: STOCK columns (switched off only in ``empty``) + the arm's extras."""
+    stock, extra = stock_layout(), extras_layout(arm, latent_dim)
+    return Layout(arm, stock.columns + extra.columns, extra.width)
+
+
+def latent_dim_from_width(arm, width):
+    """Latent dim of a latent arm from its joint-token width (0 for non-latent arms)."""
+    return width - STOCK_WIDTH - P_WIDTH if is_latent_arm(arm) else 0
+
+
+def foot_blocks_on(arm):
+    """(foot position on, foot G on): stock foot token in every arm except empty."""
+    on = ARM_BLOCKS_ON[arm]
+    return "S" in on, "G" in on
+
+
+FOOT_LAYOUT = Layout("foot", (("S", "foot_pos", 0, 3), ("G", "p_d_gain_scaling", 3, 6),
                               ("G", "robot_mass", 6, 7), ("G", "robot_dims", 7, 10)), 10)
 
 
@@ -448,7 +491,7 @@ def limb_fields(env, dof_idx, jnt_idx, joints_geo):
     seen_mass = s.seen_body_mass[st["bodies"]]
     seen_inertia = st["default_body_inertia"] * (seen_mass / st["default_body_mass"])[:, None]
     col = lambda x: np.asarray(x, dtype=np.float64).reshape(n, 1)
-    urma = {  # stock URMA fields, URMA normalisation (urma arm only)
+    urma = {  # stock URMA fields, URMA normalisation (STOCK prefix of every arm but empty)
         "urma_joint_pos": np.stack([p for p, _ in joints_geo]),
         "urma_joint_axis": np.stack([a for _, a in joints_geo]),
         "urma_joint_range": s.seen_joint_range[jnt_idx] / 4.6,
@@ -470,21 +513,38 @@ def limb_fields(env, dof_idx, jnt_idx, joints_geo):
     return f, st
 
 
-def assemble_joint_matrix(arm, fields, g, latents=None):
-    """(n_limbs, width) joint description matrix of one arm, from precomputed fields."""
-    n = fields["urma_joint_pos"].shape[0]
-    layout = joint_layout(arm, 0 if latents is None else latents.shape[1])
-    out = np.zeros((n, layout.width))
-    on = ARM_BLOCKS_ON[arm]
+def _fill(layout, on, fields, g, latents, n, offset):
+    out = np.zeros((n, layout.width - offset))
     for block, f, s, e in layout.columns:
         if block not in on:
             continue
         if block == "G":
-            out[:, s:e] = g[f][None, :]
+            out[:, s - offset:e - offset] = g[f][None, :]
         elif block == "LAT":
-            out[:, s:e] = latents
+            out[:, s - offset:e - offset] = latents
         else:
-            out[:, s:e] = fields[f]
+            out[:, s - offset:e - offset] = fields[f]
+    return out
+
+
+def stock_joint_matrix(fields, g):
+    """(n_limbs, 23) STOCK joint tokens = the urma arm's tokens (one code path for every arm)."""
+    n = fields["urma_joint_pos"].shape[0]
+    return _fill(stock_layout(), ARM_BLOCKS_ON["urma"], fields, g, None, n, 0)
+
+
+def assemble_joint_matrix(arm, fields, g, latents=None):
+    """(n_limbs, width) joint description matrix of one arm, from precomputed fields:
+    [stock_joint_matrix (zeros for empty) | extras]."""
+    n = fields["urma_joint_pos"].shape[0]
+    layout = joint_layout(arm, 0 if latents is None else latents.shape[1])
+    stock = stock_joint_matrix(fields, g) if "S" in ARM_BLOCKS_ON[arm] else np.zeros((n, STOCK_WIDTH))
+    extra_lay = extras_layout(arm, 0 if latents is None else latents.shape[1])
+    extra = _fill(extra_lay, ARM_BLOCKS_ON[arm], fields, g, latents, n, STOCK_WIDTH) if extra_lay.columns else np.zeros((n, 0))
+    out = np.concatenate([stock, extra], axis=1)
+    assert out.shape == (n, layout.width), (arm, out.shape, layout.width)
+    if arm != "empty":
+        assert np.array_equal(out[:, :STOCK_WIDTH], stock_joint_matrix(fields, g)), (arm, "STOCK prefix != urma tokens")
     return out, layout
 
 
@@ -496,10 +556,9 @@ def limb_latents(latent_dir, arm, env, body_names):
 def check_arms_distinct(env, fields, g, st, arm, latent_dir):
     """Startup guard (cf. ModuMorph's silent arm collapse): fail loudly if two arms give the same
     joint inputs for this robot, or if a block an arm switches on is all zeros."""
-    mats = {a: assemble_joint_matrix(a, fields, g) for a in NON_LATENT_ARMS}
+    mats = {a: assemble_joint_matrix(a, fields, g) for a in ("urma",) + NON_LATENT_ARMS}
     for la in sorted(set(latent_arms_available(latent_dir, robot_dir_name(env))) | ({arm} if is_latent_arm(arm) else set())):
-        if True:
-            mats[la] = assemble_joint_matrix(la, fields, g, limb_latents(latent_dir, la, env, st["body_names"]))
+        mats[la] = assemble_joint_matrix(la, fields, g, limb_latents(latent_dir, la, env, st["body_names"]))
     names = list(mats)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
@@ -546,7 +605,7 @@ def compute_name_to_description_vector(env, default_qpos_qvel, foot_geom_suffix=
         env._limb_context_checked = True
 
     out = {}
-    foot_k_on, foot_g_on = "K" in ARM_BLOCKS_ON[arm], "G" in ARM_BLOCKS_ON[arm]
+    foot_k_on, foot_g_on = foot_blocks_on(arm)
     for name in env.foot_names:
         foot_g = np.concatenate([g["p_d_gain_scaling"], g["robot_mass"], g["robot_dims"]])
         out[name] = np.concatenate([feet[name] if foot_k_on else np.zeros(3),
