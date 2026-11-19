@@ -10,7 +10,7 @@
 #SBATCH --output=/network/scratch/c/charlie.gauthier/urma_context/unimal_probe/jobs/%x-%j.out
 export XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 MUJOCO_GL=egl
 export PYTHONPATH=/network/scratch/c/charlie.gauthier/urma_context/urma-unimal-wt
-export URMA_MJX_CFG_EXTRA=/network/scratch/c/charlie.gauthier/urma_context/unimal_probe/gen/configs
+export URMA_MJX_CFG_EXTRA=${URMA_MJX_CFG_EXTRA:-/network/scratch/c/charlie.gauthier/urma_context/unimal_probe/gen/configs}
 export WARP_CACHE_PATH=/network/scratch/c/charlie.gauthier/urma_context/mjx/warp_cache JAX_COMPILATION_CACHE_DIR=/network/scratch/c/charlie.gauthier/urma_context/mjx/jax_cache
 export XDG_CACHE_HOME=/network/scratch/c/charlie.gauthier/urma_context/mjx/xdg_cache
 nvidia-smi -L
