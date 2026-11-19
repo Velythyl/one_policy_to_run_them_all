@@ -55,6 +55,18 @@ def robot_name(xml_path):
 
 # ----------------------------------------------------------------------------- MJCF
 
+# Physics/reward variants (env UNIMAL_FILTERPARENT = enable|keep_disabled, UNIMAL_REWARD = h1class|a1):
+#  filterparent: Unimal XMLs disable MuJoCo's parent-child collision filter. With URMA's impratio 100 the resulting
+#   permanent parent/child capsule contacts (median 9 per Unimal) carry near-rigid friction and brake the joints:
+#   open-loop random gaits reach only 0.00-0.13 m/s (vs 0.8-2.5 m/s with the filter enabled or with impratio 1; a1 0.57).
+#   v3 default: enable the filter (MuJoCo default, as for every URMA robot). keep_disabled = v1/v2 behaviour.
+#  reward: h1class = a1 coefficients with URMA's heavy-robot torque penalty 4e-7 and curriculum 50 M, no collision term
+#   (v2); a1 = the a1 reward unchanged, trunk contacts counted in the collision term.
+import os
+FILTERPARENT = os.environ.get("UNIMAL_FILTERPARENT", "enable")
+REWARD_VARIANT = os.environ.get("UNIMAL_REWARD", "h1class")
+
+
 def convert_xml(src):
     tree = ET.parse(src)
     root = tree.getroot()
@@ -63,6 +75,12 @@ def convert_xml(src):
     opt = root.find("option")
     opt.set("cone", "pyramidal")
     opt.set("impratio", "100")
+    if FILTERPARENT == "enable":
+        for fl in opt.findall("flag"):
+            if fl.get("filterparent") == "disable":
+                del fl.attrib["filterparent"]
+            if not fl.attrib:
+                opt.remove(fl)
     dflt = root.find("default")
     g = dflt.find("geom")
     g.set("solref", "-1000 -80")
@@ -226,8 +244,9 @@ def unimal_params(tpl, m, p, dg, scale, trunk_mass, foot_radius, nominal_trunk_z
     # cassie) use joint_torque_coeff 4e-7 and 50-200 M curriculum steps instead of a1's 4e-6 / 12 M. Unimals (150-300 Nm)
     # take the h1/cassie values. (v1 with a1's 4e-6: torque penalty alone 0.03-0.14 per step > max tracking reward 0.06,
     # so the clipped step reward was 0 everywhere.)
-    R["joint_torque_coeff"] = 4e-7
-    R["curriculum_steps"] = 50e6
+    if REWARD_VARIANT == "h1class":
+        R["joint_torque_coeff"] = 4e-7
+        R["curriculum_steps"] = 50e6
     for k in [k for k in R if k.startswith("time_since_last_touchdown_")]:
         del R[k]
     P["termination_type"] = "HeightTermination"
@@ -318,7 +337,7 @@ def convert(src, out_dir, p_gain=None, d_gain=None):
     for fn, g in zip(foot_names, foot_geoms):
         groups[fn] = [g]
     struct = {
-        "reward_collision_geoms": [], "reward_trunk_groups": [],  # filterparent is disabled in Unimals: the torso touches its
+        "reward_collision_geoms": [], "reward_trunk_groups": [] if REWARD_VARIANT == "h1class" else ["trunk"],  # filterparent is disabled in Unimals: the torso touches its
         # child limbs permanently, so a "trunk in any contact" penalty (a1 style) fires every step (v1); no collision term
         "timer_attr_to_foot": {f"time_since_last_touchdown_f{i}": i for i in range(nf)},
         "air_pairs": [[i, i] for i in range(nf)], "symmetry_pairs": sym, "timer_feet": list(range(nf)),
@@ -394,7 +413,7 @@ def convert(src, out_dir, p_gain=None, d_gain=None):
             "self_contacts_settled": int(sum(1 for c in ds.contact[:ds.ncon] if 0 not in (c.geom1, c.geom2))), "n_bodies_with_2_hinges": int(sum(np.bincount(st["bodies"]) == 2)),
             "settle": {"z_last": float(zs[-1]), "z_std_last1s": float(zs[-50:].std()), "z_min": float(zs.min()),
                        "tilt_deg_last": float(tilts[-1]), "drop": float(drop)},
-            "mass": float(m.body_mass.sum()), "p_gain": p, "d_gain": dg, "scale": scale,
+            "mass": float(m.body_mass.sum()), "filterparent": FILTERPARENT, "reward_variant": REWARD_VARIANT, "p_gain": p, "d_gain": dg, "scale": scale,
         },
     }
     out = out_dir / "configs" / f"{name}.json"
