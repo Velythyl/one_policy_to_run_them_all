@@ -125,6 +125,10 @@ def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_it
     commit, dirty = git_info(code_dir)
     task = "URMA16" if len(robots) == 16 else f"URMA{len(robots)}r"
     job = os.environ.get("SLURM_JOB_ID", "local")
+    from one_policy_to_run_them_all.mjx.robot_spec import TRAIN_16
+    # leave-one-out runs (campaign 4): the TRAIN_16 robot(s) left out of --robots; key ABSENT for full 16-robot runs
+    heldout = [r for r in TRAIN_16 if r not in robots]
+    loo = {"loo_heldout": ",".join(heldout)} if heldout else {}
     return {
         "model": {"model_name": "urma", "model_shorthand": "URMA"},
         # None = key ABSENT, as in ModuMorph's runs: wandb's {"config.x": null} filter (runselector) matches a missing
@@ -146,7 +150,7 @@ def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_it
                  "latent_meta": latent_meta(a.latent_dir, arm), "recipe_deviations_gpu": deviations,
                  "warp_ffi": list(warp_ffi), "steps_per_iter": steps_per_iter, "nr_iters": nr_iters,
                  "reward_terms": list(REWARD_TERMS), "first_job": {"slurm_job_id": job, "gpu": gpu,
-                 "cluster": os.environ.get("SLURM_CLUSTER_NAME", "unknown"), "host": socket.gethostname()}},
+                 "cluster": os.environ.get("SLURM_CLUSTER_NAME", "unknown"), "host": socket.gethostname()}, **loo},
     }
 
 
