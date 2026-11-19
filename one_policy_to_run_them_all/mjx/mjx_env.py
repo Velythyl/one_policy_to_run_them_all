@@ -364,7 +364,14 @@ class MJXRobotEnv:
         self.latents = None
         if lc.is_latent_arm(self.context_arm):
             lat = lc.load_latents(self.latent_dir, self.context_arm, sp.name, m)
-            self.latents = f64([lat[b] for b in ctx["body_names"]])
+            # per-joint lookup (Unimals, campaign 6): latent files keyed "joint:<joint name>" give each hinge its own
+            # latent (Unimal scans are segmented per joint; 2 hinges can share one body). URMA robots: per body.
+            jkeys = ["joint:" + jn for jn in c["joint_names"]]
+            if all(k in lat for k in jkeys):
+                self.latents = f64([lat[k] for k in jkeys])
+            else:
+                assert not any(k in lat for k in jkeys), f"{sp.name}: partial per-joint latents"
+                self.latents = f64([lat[b] for b in ctx["body_names"]])
         lat_dim = 0 if self.latents is None else self.latents.shape[1]
         self.layout = lc.joint_layout(self.context_arm, lat_dim)
         self.stock_layout = lc.stock_layout()

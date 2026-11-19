@@ -22,7 +22,7 @@ Conversion rules (see UNIMAL_PROBE.md for the reasoning):
   vel    - max joint velocity: MAX_JOINT_VEL for every joint (Unimals define none).
   heights- initial_drop_height = trunk z with the lowest point 1 cm above the floor at the nominal pose;
            nominal_trunk_z (base-height reward) = trunk z after settling 3 s under PD at nominal (MuJoCo C);
-           termination = height < 0.5 x nominal_trunk_z (ModuMorph TerminateOnFalling, STAND_HEIGHT_RATIO 0.5).
+           termination (campaign 6, user decision C) = the a1 template's: trunk geom in any contact (Rudin2022).
   DR/rew - parameters copied from unitree_a1's config (quadruped template, rudin_own_var reward, a1 model DR),
            except the robot-specific ranges re-centred on the Unimal's values (see unimal_params()).
   context- limb_context._robot_geometry / limb_fields / assemble_joint_matrix on a light stand-in env. Unimal limbs can
@@ -136,13 +136,24 @@ def settle(m, nominal, p, dgain, z0, seconds=3.0, nsub=4):
     d = pose(m, nominal, z0)
     n_ctrl = int(seconds / (m.opt.timestep * nsub))
     zs, tilts = [], []
-    for _ in range(n_ctrl):
+    trunk_geoms = set(range(m.body_geomadr[1], m.body_geomadr[1] + m.body_geomnum[1]))
+    # campaign 6: first control step (0.02 s) at which a trunk geom is in contact (URMA a1 Rudin2022Termination =
+    # trunk geom in ANY contact), split into floor contacts and self contacts
+    first = {"floor": None, "self": None}
+    for i in range(n_ctrl):
         tau = p * (nominal - d.qpos[7:]) - dgain * d.qvel[6:]
         d.ctrl[:] = tau
         for _ in range(nsub):
             mujoco.mj_step(m, d)
+            for c in d.contact[:d.ncon]:
+                if c.dist >= c.includemargin or not ({c.geom1, c.geom2} & trunk_geoms):
+                    continue
+                kind = "floor" if 0 in (c.geom1, c.geom2) else "self"
+                if first[kind] is None:
+                    first[kind] = (i + 1) * m.opt.timestep * nsub
         R = d.xmat[1].reshape(3, 3)
         zs.append(d.qpos[2]); tilts.append(np.degrees(np.arccos(np.clip(R[2, 2], -1, 1))))
+    settle.trunk_contact_first_s = first
     return np.asarray(zs), np.asarray(tilts), d
 
 
@@ -249,8 +260,9 @@ def unimal_params(tpl, m, p, dg, scale, trunk_mass, foot_radius, nominal_trunk_z
         R["curriculum_steps"] = 50e6
     for k in [k for k in R if k.startswith("time_since_last_touchdown_")]:
         del R[k]
-    P["termination_type"] = "HeightTermination"
-    P["termination"] = {}
+    # campaign 6 (user DECISION C, 2026-11-19): keep the a1 template's termination (Rudin2022Termination: a trunk geom
+    # in any contact). termination_type / termination stay the template's values. (probe v3 used height < 0.5 x
+    # nominal_trunk_z, ModuMorph's rule; rejected by the user.)
     return P
 
 
@@ -342,7 +354,7 @@ def convert(src, out_dir, p_gain=None, d_gain=None):
         "timer_attr_to_foot": {f"time_since_last_touchdown_f{i}": i for i in range(nf)},
         "air_pairs": [[i, i] for i in range(nf)], "symmetry_pairs": sym, "timer_feet": list(range(nf)),
         "nominal_diff_joints": [],
-        "termination": {"kind": "height", "threshold": 0.5 * nominal_trunk_z},
+        "termination": dict(tpl["struct"]["termination"]),  # a1: {"kind": "contact", "groups": ["trunk"]}
         "seen_dr": {"foot_size_geoms": foot_geoms, "foot_size_noise_power": 1, "damping_mode": "uniform",
                     "frictionloss_mode": "uniform", "keep_default": {}, "armature_stay_typo": True},
         "model_dr": {"friction_mode": "ground_feet", "friction_feet_geoms": foot_geoms},
@@ -413,6 +425,9 @@ def convert(src, out_dir, p_gain=None, d_gain=None):
             "self_contacts_settled": int(sum(1 for c in ds.contact[:ds.ncon] if 0 not in (c.geom1, c.geom2))), "n_bodies_with_2_hinges": int(sum(np.bincount(st["bodies"]) == 2)),
             "settle": {"z_last": float(zs[-1]), "z_std_last1s": float(zs[-50:].std()), "z_min": float(zs.min()),
                        "tilt_deg_last": float(tilts[-1]), "drop": float(drop)},
+            "trunk_contact_first_s": dict(settle.trunk_contact_first_s),  # settle from the drop pose under PD at nominal
+            "trunk_floor_contact_settled": bool(any(0 in (c.geom1, c.geom2) and m.geom_bodyid[c.geom2 if c.geom1 == 0 else c.geom1] == 1
+                                                    for c in ds.contact[:ds.ncon] if c.dist < c.includemargin)),
             "mass": float(m.body_mass.sum()), "filterparent": FILTERPARENT, "reward_variant": REWARD_VARIANT, "p_gain": p, "d_gain": dg, "scale": scale,
         },
     }

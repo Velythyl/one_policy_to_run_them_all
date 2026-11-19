@@ -65,5 +65,8 @@ def load_spec(name):
     for root in [CFG_ROOT] + CFG_EXTRA:
         f = root / f"{name}.json"
         if f.is_file():
-            return RobotSpec(name, json.loads(f.read_text()))
+            cfg = json.loads(f.read_text())
+            if cfg.get("xml_path") and not Path(cfg["xml_path"]).is_file():  # generated robot copied to another cluster:
+                cfg["xml_path"] = str(root.parent / "xml" / cfg["xml_file"])  # <gen>/configs/<r>.json -> <gen>/xml/<r>.xml
+            return RobotSpec(name, cfg)
     raise FileNotFoundError(f"no config for robot {name} in {[CFG_ROOT] + CFG_EXTRA}")

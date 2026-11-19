@@ -87,7 +87,28 @@ def parse():
     p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--bench_iters", type=int, default=0, help=">0: only time this many iterations")
     p.add_argument("--debug_finite", action="store_true", help="report non-finite leaves of the first rollout")
+    # campaign 6 (URMA 16 + 100 Unimals): grouped compilation + per-robot env counts + final full evaluation
+    p.add_argument("--group_size", type=int, default=0,
+                   help="0 = one jitted PPO iteration over all robot types (campaigns 1-5). >0 = robot types are compiled in "
+                        "groups of this size (one jitted rollout+GAE and one jitted minibatch-gradient per group, called "
+                        "in sequence by the host; gradients summed, then one optimizer step per minibatch). Same PPO math; "
+                        "host RAM bounded by one group's compile; each group's program is cached by JAX's persistent cache")
+    p.add_argument("--nr_envs_override", default="",
+                   help="comma list pattern=N (fnmatch on the robot name) overriding --nr_envs, e.g. 'unimal_*=196' "
+                        "(env steps per robot are proportional to its env count; needs --group_size > 0)")
+    p.add_argument("--eval_group_size", type=int, default=4, help="grouped path: eval robots compiled per group of this size")
+    p.add_argument("--final_eval_robots", default="",
+                   help="@file or comma list: evaluated once on the final policy (same protocol as --eval_robots), written to "
+                        "<out>/final_eval.json before DONE (grouped path)")
+    p.add_argument("--train_set", default="", help="wandb urma.train_set (campaign tag, e.g. urma16+unimal100)")
     return p.parse_args()
+
+
+def robot_list(s):
+    """'a,b,c' or '@/path/to/file' (one robot per line, '#' comments)."""
+    if s.startswith("@"):
+        return [l.split("#")[0].strip() for l in open(s[1:]) if l.split("#")[0].strip()]
+    return [r for r in s.split(",") if r]
 
 
 def gpu_mem_diag():
@@ -115,24 +136,32 @@ def main():
     a = parse()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    robots = a.robots.split(",")
+    robots = robot_list(a.robots)
     R = len(robots)
     N, T = a.nr_envs, a.nr_steps
-    envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
-                        nr_envs_per_type=N, model_variant=a.model_variant, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor, physics_overrides=a.physics_overrides) for r in robots]
-    eval_robots = [r for r in a.eval_robots.split(",") if r]
-    eval_envs = [MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
-                             nr_envs_per_type=a.eval_envs, model_variant=a.model_variant, eval_mode=True,
-                             contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor, physics_overrides=a.physics_overrides) for r in eval_robots]
+    import fnmatch
+    ovr = [(x.split("=")[0], int(x.split("=")[1])) for x in a.nr_envs_override.split(",") if x]
+    Ns = [next((n for pat, n in ovr if fnmatch.fnmatch(r, pat)), N) for r in robots]
+    GROUPED = a.group_size > 0
+    assert GROUPED or len(set(Ns)) == 1, "--nr_envs_override needs --group_size > 0"
+    mk_env = lambda r, n, ev=False: MJXRobotEnv(load_spec(r), context_arm=a.context_arm, latent_dir=a.latent_dir, impl=a.impl,
+                        nr_envs_per_type=n, model_variant=a.model_variant, eval_mode=ev, contacts_per_env=a.contacts_per_env, solimp_dmax_clamp=a.solimp_dmax_clamp, friction_tangential_floor=a.friction_tangential_floor, physics_overrides=a.physics_overrides)
+    envs = [mk_env(r, n) for r, n in zip(robots, Ns)]
+    eval_robots = robot_list(a.eval_robots)
+    eval_envs = [mk_env(r, a.eval_envs, True) for r in eval_robots]
+    final_eval_robots = robot_list(a.final_eval_robots)
+    for n_ in Ns:
+        assert (n_ * T) % a.nr_minibatches == 0
     batch_per_type = N * T
-    assert batch_per_type % a.nr_minibatches == 0
     mb = batch_per_type // a.nr_minibatches
-    steps_per_iter = R * N * T
+    mbs = [n_ * T // a.nr_minibatches for n_ in Ns]
+    steps_per_iter = sum(Ns) * T
     nr_iters = int(a.total_steps // steps_per_iter)
     nr_updates = max(nr_iters, 1)
-    print(json.dumps({"robots": robots, "nr_envs_per_type": N, "nr_steps": T, "batch": steps_per_iter,
-                      "minibatch_per_type": mb, "iters": nr_iters, "gpu": jax.devices()[0].device_kind,
-                      "impl": a.impl, "arm": a.context_arm, "variant": a.model_variant}), flush=True)
+    print(json.dumps({"robots": robots, "nr_envs_per_type": N, "nr_envs_per_robot": dict(zip(robots, Ns)), "nr_steps": T,
+                      "batch": steps_per_iter, "minibatch_per_type": mb, "iters": nr_iters, "gpu": jax.devices()[0].device_kind,
+                      "impl": a.impl, "arm": a.context_arm, "variant": a.model_variant, "group_size": a.group_size,
+                      "total_worlds": sum(Ns), "steps_per_robot_total": {r: nr_iters * n_ * T for r, n_ in zip(robots, Ns)}}), flush=True)
     deviations = {"solimp_dmax_clamp": a.solimp_dmax_clamp,  # float32 Warp: cap contact impedance dmax
                   "friction_tangential_floor": a.friction_tangential_floor, "physics_overrides": a.physics_overrides}  # DR tangential mu in [floor, max]
     deviations["applied_impratio_adapt_mu0"] = {e.spec.name: e.impratio_adapt_mu0 for e in envs + eval_envs}
@@ -153,7 +182,7 @@ def main():
     key = jax.random.PRNGKey(a.seed)
     key, kp, kc, *ke = jax.random.split(key, 3 + R)
     t0 = time.time()
-    states = [jax.jit(partial(e.batch_reset, nr_envs=N))(k) for e, k in zip(envs, ke)]
+    states = [jax.jit(partial(e.batch_reset, nr_envs=n_))(k) for e, k, n_ in zip(envs, ke, Ns)]
     o0 = states[0].obs
     pparams = policy.init(kp, o0["jd"][:2], o0["js"][:2], o0["fd"][:2], o0["fs"][:2], o0["gp"][:2])
     cparams = critic.init(kc, o0["jd"][:2], o0["js"][:2], o0["fd"][:2], o0["fs"][:2], o0["gc"][:2])
@@ -321,6 +350,184 @@ def main():
                         "eps_track_perf": (trk * seen).sum() / cnt, "episodes": seen.sum()}
         return stats
 
+    # ------------------------------------------------------------------ grouped compilation (--group_size > 0)
+    # Same math as rollout/update/iteration above, but each group of robot types is its own jitted program:
+    #   rollout_g:  lax.scan over nr_steps of the group's batch_steps + GAE + flatten + per-robot stats
+    #   grad_g:     gradient of sum_{robots in group} loss_r on minibatch j, added into a donated accumulator
+    #   apply:      grads / R (= gradient of the old mean over robot types), one Adam step for policy and critic
+    # Per minibatch the host calls grad_g for every group, then apply; 10 epochs x 16 minibatches as before.
+    def robot_stats(tr):
+        dn = tr["done"].astype(jnp.float32)
+        cnt = dn.sum()
+        return {
+            "episodes": cnt,
+            "ep_return": jnp.where(cnt > 0, (tr["ep_ret"] * dn).sum() / jnp.maximum(cnt, 1), jnp.nan),
+            "ep_length": jnp.where(cnt > 0, (tr["ep_len"] * dn).sum() / jnp.maximum(cnt, 1), jnp.nan),
+            "eps_track_perf": jnp.where(cnt > 0, (tr["eps_track"] * dn).sum() / jnp.maximum(cnt, 1), jnp.nan),
+            "step_reward": tr["rew"].mean(),
+            "track_err_sq": tr["track_err"].mean(),
+            "sim_unstable": tr["unstable"].sum(),
+            **{k: tr[k][-1].sum() for k in tr if k.startswith("ovf_")},
+            **{k: tr[k].max() for k in ("nacon_frac", "nefc_max") if k in tr},
+            **{f"term_{t}": jnp.where(cnt > 0, tr["ep_terms"][..., j].sum() / jnp.maximum(cnt, 1), jnp.nan)
+               for j, t in enumerate(REWARD_TERMS)},
+        }
+
+    def make_group(idx):
+        genvs, gN, gnames = [envs[i] for i in idx], [Ns[i] for i in idx], [robots[i] for i in idx]
+
+        def rollout_g(pparams, cparams, states, key, racc):
+            def body(carry, _):
+                states, key, racc = carry
+                new_states, trans, new_racc = [], [], []
+                for i, e in enumerate(genvs):
+                    key, k = jax.random.split(key)
+                    o = states[i].obs
+                    mean, logstd = pol(pparams, o)
+                    std = jnp.exp(logstd)
+                    act = mean + std * jax.random.normal(k, mean.shape)
+                    logp = (-0.5 * ((act - mean) / std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - logstd).sum(-1)
+                    v = val(cparams, o)
+                    s2, info = e.batch_step(states[i], act)
+                    nv = val(cparams, info["final_obs"])
+                    new_states.append(s2)
+                    acc = racc[i] + info["reward_terms"]
+                    dn_ = info["done"][:, None]
+                    new_racc.append(jnp.where(dn_, 0.0, acc))
+                    trans.append(dict(obs=o, act=act, logp=logp, val=v, next_val=nv, rew=info["reward"],
+                                      term=info["terminated"].astype(jnp.float32), done=info["done"],
+                                      ep_ret=info["episode_return"], ep_len=info["episode_length"],
+                                      eps_track=info["eps_track_perf_perc"], track_err=info["track_err_sq"],
+                                      unstable=info["sim_unstable"].astype(jnp.float32), ep_terms=jnp.where(dn_, acc, 0.0),
+                                      **{k: info[k].astype(jnp.float32) for k in info if k.startswith("ovf_") or k in ("nacon_frac", "nefc_max")}))
+                return (new_states, key, new_racc), trans
+            (states, key, racc), traj = jax.lax.scan(body, (states, key, racc), None, length=T)
+            flat, stats = [], {}
+            for r, n_, tr in zip(gnames, gN, traj):
+                adv, ret = gae(tr)
+                fl = lambda x, n_=n_: x.reshape((T * n_,) + x.shape[2:])
+                flat.append(dict(obs=jax.tree_util.tree_map(fl, tr["obs"]), act=fl(tr["act"]), logp=fl(tr["logp"]),
+                                 adv=fl(adv), ret=fl(ret), val=fl(tr["val"])))
+                stats[r] = robot_stats(tr)
+            return states, key, racc, flat, stats
+
+        def grad_g(pp, cp, flat, perms, j, acc):
+            def loss_fn(pp, cp):
+                tot, mets = 0.0, []
+                for i in range(len(idx)):
+                    b = jax.tree_util.tree_map(lambda x: x[perms[i][j]], flat[i])
+                    adv = (b["adv"] - b["adv"].mean()) / (b["adv"].std() + 1e-8)
+                    mean, logstd = pol(pp, b["obs"])
+                    std = jnp.exp(logstd)
+                    nlp = (-0.5 * ((b["act"] - mean) / std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - logstd).sum(-1)
+                    ent = (logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)).sum(-1)
+                    lr_ = nlp - b["logp"]
+                    ratio = jnp.exp(lr_)
+                    pg = jnp.maximum(-adv * ratio, -adv * jnp.clip(ratio, 1 - a.clip_range, 1 + a.clip_range))
+                    v = val(cp, b["obs"])
+                    vl = 0.5 * (v - b["ret"]) ** 2
+                    loss = pg - a.entropy_coef * ent + a.critic_coef * vl
+                    tot = tot + loss.mean()
+                    mets.append({"pg_loss": pg.mean(), "critic_loss": vl.mean(), "approx_kl": ((ratio - 1) - lr_).mean(),
+                                 "clip_frac": (jnp.abs(ratio - 1) > a.clip_range).mean(), "std": std.mean()})
+                return tot, jax.tree_util.tree_map(lambda *x: jnp.sum(jnp.stack(x)), *mets)
+            (_, met), (gp, gc) = jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)(pp, cp)
+            add = lambda x, y: jax.tree_util.tree_map(jnp.add, x, y)
+            return add(acc[0], gp), add(acc[1], gc), add(acc[2], met)
+
+        return dict(idx=idx, rollout=jax.jit(rollout_g, donate_argnums=(2, 4)), grad=jax.jit(grad_g, donate_argnums=(5,)))
+
+    if GROUPED:
+        groups = [make_group(list(range(i, min(i + a.group_size, R)))) for i in range(0, R, a.group_size)]
+
+        @jax.jit
+        def make_perms(key):  # identical draws to update(): key, *pk = split(key, R + 1)
+            key, *pk = jax.random.split(key, R + 1)
+            return key, [jax.vmap(lambda k: jax.random.permutation(k, T * n_))(jax.random.split(k, a.nr_epochs)).reshape(-1, m_)
+                         for k, n_, m_ in zip(pk, Ns, mbs)]
+
+        MET_KEYS = ("pg_loss", "critic_loss", "approx_kl", "clip_frac", "std")
+
+        @partial(jax.jit, donate_argnums=(0, 1, 2, 3))
+        def apply_grads(pstate, cstate, acc, macc):
+            gp, gc, met = jax.tree_util.tree_map(lambda x: x / R, acc)
+            met = dict(met, policy_grad_norm=optax.global_norm(gp))
+            pstate, cstate = pstate.apply_gradients(grads=gp), cstate.apply_gradients(grads=gc)
+            zero = jax.tree_util.tree_map(jnp.zeros_like, acc)
+            return pstate, cstate, zero, jax.tree_util.tree_map(jnp.add, macc, met)
+
+        @jax.jit
+        def explained_var(rets, vals):
+            allret, allval = jnp.concatenate(rets), jnp.concatenate(vals)
+            return 1 - jnp.var(allret - allval) / (jnp.var(allret) + 1e-8)
+
+        def grouped_iteration(pstate, cstate, states, key, racc):
+            # one group: the key stream of iteration() exactly (equivalence test); several: one key per group
+            gk = [key] if len(groups) == 1 else None
+            if gk is None:
+                key, *gk = jax.random.split(key, len(groups) + 1)
+            flats, stats = [None] * R, {}
+            states, racc = list(states), list(racc)
+            for g, k in zip(groups, gk):
+                ix = g["idx"]
+                st_g, k_out, ra_g, fl_g, sts = g["rollout"](pstate.params, cstate.params, [states[i] for i in ix], k, [racc[i] for i in ix])
+                if len(groups) == 1:
+                    key = k_out
+                for n_, i in enumerate(ix):
+                    states[i], racc[i], flats[i] = st_g[n_], ra_g[n_], fl_g[n_]
+                stats.update(sts)
+            key, perms = make_perms(key)
+            z = lambda t: jax.tree_util.tree_map(jnp.zeros_like, t)
+            acc = (z(pstate.params), z(cstate.params), {k_: jnp.zeros(()) for k_ in MET_KEYS})
+            macc = dict({k_: jnp.zeros(()) for k_ in MET_KEYS}, policy_grad_norm=jnp.zeros(()))
+            nmb = a.nr_epochs * a.nr_minibatches
+            for j in range(nmb):
+                jj = jnp.int32(j)
+                for g in groups:
+                    ix = g["idx"]
+                    acc = g["grad"](pstate.params, cstate.params, [flats[i] for i in ix], [perms[i] for i in ix], jj, acc)
+                pstate, cstate, acc, macc = apply_grads(pstate, cstate, acc, macc)
+            met = {k_: v / nmb for k_, v in macc.items()}
+            met["explained_var"] = explained_var([f["ret"] for f in flats], [f["val"] for f in flats])
+            return pstate, cstate, states, key, met, stats, racc
+
+        eval_groups = []
+        def make_eval_group(names, evs):
+            def evaluate_g(pparams, key):
+                st = {}
+                for r, e in zip(names, evs):
+                    key, kr, kl = jax.random.split(key, 3)
+                    s0 = e.batch_reset(kr, a.eval_envs)
+
+                    def body(c, _, e=e):
+                        s, k, seen, ret, ln, trk = c
+                        k, ka = jax.random.split(k)
+                        mean, logstd = pol(pparams, s.obs)
+                        act = mean + jnp.exp(logstd) * jax.random.normal(ka, mean.shape)
+                        s, info = e.batch_step(s, act)
+                        first = info["done"] & ~seen
+                        ret = jnp.where(first, info["episode_return"], ret)
+                        ln = jnp.where(first, info["episode_length"], ln)
+                        trk = jnp.where(first, info["eps_track_perf_perc"], trk)
+                        return (s, k, seen | info["done"], ret, ln, trk), None
+                    zz = jnp.zeros(a.eval_envs)
+                    (s, _, seen, ret, ln, trk), _ = jax.lax.scan(body, (s0, kl, jnp.zeros(a.eval_envs, bool), zz, zz, zz), None, length=e.horizon)
+                    cnt = jnp.maximum(seen.sum(), 1)
+                    st[r] = {"ep_return": (ret * seen).sum() / cnt, "ep_length": (ln * seen).sum() / cnt,
+                             "eps_track_perf": (trk * seen).sum() / cnt, "episodes": seen.sum()}
+                return st
+            return jax.jit(evaluate_g)
+
+        for i in range(0, len(eval_robots), a.eval_group_size):
+            eval_groups.append(make_eval_group(eval_robots[i:i + a.eval_group_size], eval_envs[i:i + a.eval_group_size]))
+
+        def grouped_evaluate(pparams, key, egroups=None):
+            out_ = {}
+            for fn in (egroups or eval_groups):
+                key, k = jax.random.split(key)
+                out_.update(jax.device_get(fn(pparams, k)))
+            return out_
+
     stop = {"flag": False}
     signal.signal(signal.SIGUSR1, lambda *_: stop.update(flag=True))  # Slurm --signal=USR1@<s>: checkpoint + exit(3)
 
@@ -333,7 +540,7 @@ def main():
                          "iter": it_done, "key": jax.device_get(key), "args": vars(a)}, f)
         os.replace(tmp, ckpt)
 
-    racc = [jnp.zeros((N, len(REWARD_TERMS)), jnp.float32) for _ in robots]  # fresh episodes after (re)start
+    racc = [jnp.zeros((n_, len(REWARD_TERMS)), jnp.float32) for n_ in Ns]  # fresh episodes after (re)start
     if a.debug_finite:
         st_, k_, traj_, _ = jax.jit(rollout)(pstate, cstate, states, key, racc)
         for r, tr in zip(robots, traj_):
@@ -350,19 +557,21 @@ def main():
     n_run = a.bench_iters if a.bench_iters > 0 else nr_iters
     for it in range(start_iter, n_run):
         ti = time.time()
-        pstate, cstate, states, key, met, stats, racc = iteration(pstate, cstate, states, key, racc)
+        step_fn = grouped_iteration if GROUPED else iteration
+        pstate, cstate, states, key, met, stats, racc = step_fn(pstate, cstate, states, key, racc)
         jax.block_until_ready(met)
         dt = time.time() - ti
         if it == start_iter:
             print(json.dumps({"compile_plus_first_iter_s": round(time.time() - t_compile, 1), "setup_s": round(t_compile - t0, 1)}), flush=True)
         rec = {"iter": it + 1, "env_steps": (it + 1) * steps_per_iter, "steps_per_robot": (it + 1) * N * T,
+               **({"steps_per_robot_min": (it + 1) * min(Ns) * T} if GROUPED else {}),
                "sps": round(steps_per_iter / dt), "iter_s": round(dt, 2), "wall_s": round(time.time() - t0, 1),
                **{k: float(v) for k, v in met.items()},
                **{f"{r}/{k}": float(v) for r, s in stats.items() for k, v in s.items()}}
         if eval_envs and a.bench_iters == 0 and (it + 1) % eval_every == 0:
             te = time.time()
             key, ke = jax.random.split(key)
-            ev = jax.device_get(evaluate(pstate.params, ke))
+            ev = grouped_evaluate(pstate.params, ke) if GROUPED else jax.device_get(evaluate(pstate.params, ke))
             rec.update({f"eval/{r}/{k}": float(v) for r, s_ in ev.items() for k, v in s_.items()})
             rec["eval_s"] = round(time.time() - te, 1)
         rec.update(gpu_mem_diag())
@@ -379,6 +588,25 @@ def main():
             if wlog is not None:
                 wlog.finish(0)
             sys.exit(3)
+    if a.bench_iters == 0 and final_eval_robots and not (out / "final_eval.json").is_file():
+        assert GROUPED, "--final_eval_robots needs --group_size > 0"
+        tf = time.time()
+        fe = {}
+        for i in range(0, len(final_eval_robots), a.eval_group_size):
+            names = final_eval_robots[i:i + a.eval_group_size]
+            fn = make_eval_group(names, [mk_env(r, a.eval_envs, True) for r in names])
+            kf = jax.random.fold_in(jax.random.PRNGKey(a.seed + 7919), i)  # fixed keys: independent of the training key stream
+            fe.update({r: {k: float(v) for k, v in d_.items()} for r, d_ in jax.device_get(fn(pstate.params, kf)).items()})
+            print(json.dumps({"final_eval_done": len(fe), "of": len(final_eval_robots), "s": round(time.time() - tf, 1)}), flush=True)
+            if stop["flag"] or (a.max_wall_s > 0 and time.time() - t0 > a.max_wall_s):
+                print("final eval interrupted (time); the next chained job redoes it", flush=True)
+                if wlog is not None:
+                    wlog.finish(0)
+                sys.exit(3)
+        (out / "final_eval.json").write_text(json.dumps({"iter": nr_iters, "eval_envs": a.eval_envs, "robots": fe,
+                                                         "wall_s": round(time.time() - tf, 1)}, indent=1))
+        if wlog is not None:
+            wlog.log_final_eval(fe)
     if a.bench_iters == 0:
         (out / "DONE").write_text(str(nr_iters))
     if wlog is not None:

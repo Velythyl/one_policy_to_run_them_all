@@ -141,7 +141,7 @@ def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_it
         "meta": {"project": os.environ.get("URMA_WANDB_PROJECT", DEFAULT_PROJECT), "run_name": run_name, "seed": a.seed,
                  "config_name": f"urma_mjx_{task}", "HYDRA_SWEEP_DIR": str(Path(a.out).resolve()),
                  "SLURM_JOB_ID": job, "wandb_mode": os.environ.get("WANDB_MODE", "online"),
-                 "tags": ["urma_mjx", arm, lc.CONTEXT_VERSION]},
+                 "tags": ["urma_mjx", arm, lc.CONTEXT_VERSION] + ([getattr(a, "train_set")] if getattr(a, "train_set", "") else [])},
         "urma": {"context_arm": arm, "context_version": lc.CONTEXT_VERSION, "pretty_arm": PRETTY.get(arm, arm),
                  "stock_context": arm == "urma", "stock_superset": arm != "empty",
                  "context_layout": context_layout(arm, a.latent_dir, robots),
@@ -150,7 +150,9 @@ def build_config(a, robots, eval_robots, deviations, warp_ffi, gpu, steps_per_it
                  "latent_meta": latent_meta(a.latent_dir, arm), "recipe_deviations_gpu": deviations,
                  "warp_ffi": list(warp_ffi), "steps_per_iter": steps_per_iter, "nr_iters": nr_iters,
                  "reward_terms": list(REWARD_TERMS), "first_job": {"slurm_job_id": job, "gpu": gpu,
-                 "cluster": os.environ.get("SLURM_CLUSTER_NAME", "unknown"), "host": socket.gethostname()}, **loo},
+                 "cluster": os.environ.get("SLURM_CLUSTER_NAME", "unknown"), "host": socket.gethostname()}, **loo,
+                 # campaign 6: training-set tag (e.g. "urma16+unimal100"); key ABSENT for campaigns 1-5
+                 **({"train_set": a.train_set} if getattr(a, "train_set", "") else {})},
     }
 
 
@@ -211,7 +213,18 @@ class TrainMetrics:
                 key = f"__reward__{t}"
                 if all(key in self.last[r] for r in self.robots):
                     m[f"train_stats__env__reward/{key}"] = self._env(key, [self.last[r][key] for r in self.robots])[1]
+        # campaign 6: separate means for the URMA robots and the Unimals (robots named unimal_*), when both are present
+        subsets = {"urma": [r for r in self.robots if not r.startswith("unimal_")], "unimal": [r for r in self.robots if r.startswith("unimal_")]}
+        if subsets["unimal"]:
+            for sub, rs in subsets.items():
+                for k in ("reward", "ep_len", "metric"):
+                    if rs and all(k in self.last.get(r, {}) for r in rs):
+                        m[f"train_stats__{sub}__/{k}"] = float(np.mean([self.last[r][k] for r in rs]))
         ev = [r for r in self.eval_robots if f"eval/{r}/ep_return" in rec]
+        if ev and any(r.startswith("unimal_") for r in ev):
+            for sub, rs in (("urma", [r for r in ev if not r.startswith("unimal_")]), ("unimal", [r for r in ev if r.startswith("unimal_")])):
+                if rs:
+                    m[f"eval__{sub}__/reward"] = float(np.mean([rec[f"eval/{r}/ep_return"] for r in rs]))
         if ev:
             for r in ev:
                 for k, src in per.items():
@@ -285,6 +298,21 @@ class WandbLogger:
         except Exception as e:
             _warn(f"wandb log failed, disabling wandb for this job: {e!r}")
             self._finish_quiet(1)
+
+    def log_final_eval(self, fe):
+        """Final full evaluation (campaign 6): summary keys final_eval/<robot>/reward + means (URMA / Unimal)."""
+        if self.run is None:
+            return
+        try:
+            for r, d in fe.items():
+                self.run.summary[f"final_eval/{r}/reward"] = d["ep_return"]
+                self.run.summary[f"final_eval/{r}/ep_len"] = d["ep_length"]
+                self.run.summary[f"final_eval/{r}/metric"] = d["eps_track_perf"]
+            for sub, rs in (("urma", [r for r in fe if not r.startswith("unimal_")]), ("unimal", [r for r in fe if r.startswith("unimal_")])):
+                if rs:
+                    self.run.summary[f"final_eval__{sub}__/reward"] = float(np.mean([fe[r]["ep_return"] for r in rs]))
+        except Exception as e:
+            _warn(f"wandb final eval log failed: {e!r}")
 
     def _finish_quiet(self, code):
         try:
