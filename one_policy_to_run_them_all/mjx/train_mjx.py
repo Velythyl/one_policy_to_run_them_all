@@ -461,7 +461,10 @@ def main():
             allret, allval = jnp.concatenate(rets), jnp.concatenate(vals)
             return 1 - jnp.var(allret - allval) / (jnp.var(allret) + 1e-8)
 
+        TIMING = os.environ.get("URMA_TIMING", "0") == "1"
+
         def grouped_iteration(pstate, cstate, states, key, racc):
+            t_i = time.time()
             # one group: the key stream of iteration() exactly (equivalence test); several: one key per group
             gk = [key] if len(groups) == 1 else None
             if gk is None:
@@ -476,6 +479,8 @@ def main():
                 for n_, i in enumerate(ix):
                     states[i], racc[i], flats[i] = st_g[n_], ra_g[n_], fl_g[n_]
                 stats.update(sts)
+            if TIMING:
+                jax.block_until_ready(flats); t_r = time.time()
             key, perms = make_perms(key)
             z = lambda t: jax.tree_util.tree_map(jnp.zeros_like, t)
             acc = (z(pstate.params), z(cstate.params), {k_: jnp.zeros(()) for k_ in MET_KEYS})
@@ -489,6 +494,8 @@ def main():
                 pstate, cstate, acc, macc = apply_grads(pstate, cstate, acc, macc)
             met = {k_: v / nmb for k_, v in macc.items()}
             met["explained_var"] = explained_var([f["ret"] for f in flats], [f["val"] for f in flats])
+            if TIMING:  # logging only: wall time of the rollout phase vs the update phase
+                jax.block_until_ready(met); met["time/update_s"] = time.time() - t_r; met["time/rollout_s"] = t_r - t_i
             return pstate, cstate, states, key, met, stats, racc
 
         eval_groups = []
