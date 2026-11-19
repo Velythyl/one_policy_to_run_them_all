@@ -222,6 +222,12 @@ def unimal_params(tpl, m, p, dg, scale, trunk_mass, foot_radius, nominal_trunk_z
     # init, command, noise, dropout, sampling probs: a1 values unchanged
     R = P["reward"]
     R["nominal_trunk_z"] = nominal_trunk_z
+    # URMA scales the torque penalty and the curriculum per robot: robots with 150-900 Nm joints (h1, talos, atlas,
+    # cassie) use joint_torque_coeff 4e-7 and 50-200 M curriculum steps instead of a1's 4e-6 / 12 M. Unimals (150-300 Nm)
+    # take the h1/cassie values. (v1 with a1's 4e-6: torque penalty alone 0.03-0.14 per step > max tracking reward 0.06,
+    # so the clipped step reward was 0 everywhere.)
+    R["joint_torque_coeff"] = 4e-7
+    R["curriculum_steps"] = 50e6
     for k in [k for k in R if k.startswith("time_since_last_touchdown_")]:
         del R[k]
     P["termination_type"] = "HeightTermination"
@@ -312,7 +318,8 @@ def convert(src, out_dir, p_gain=None, d_gain=None):
     for fn, g in zip(foot_names, foot_geoms):
         groups[fn] = [g]
     struct = {
-        "reward_collision_geoms": [], "reward_trunk_groups": ["trunk"],
+        "reward_collision_geoms": [], "reward_trunk_groups": [],  # filterparent is disabled in Unimals: the torso touches its
+        # child limbs permanently, so a "trunk in any contact" penalty (a1 style) fires every step (v1); no collision term
         "timer_attr_to_foot": {f"time_since_last_touchdown_f{i}": i for i in range(nf)},
         "air_pairs": [[i, i] for i in range(nf)], "symmetry_pairs": sym, "timer_feet": list(range(nf)),
         "nominal_diff_joints": [],
