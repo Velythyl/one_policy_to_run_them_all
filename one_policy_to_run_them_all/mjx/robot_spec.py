@@ -36,6 +36,8 @@ class RobotSpec:
 
     @property
     def xml_path(self):
+        if self.cfg.get("xml_path"):  # generated robots (unimal_convert.py) carry an absolute XML path
+            return Path(self.cfg["xml_path"])
         if MANIFEST.is_file():
             ent = json.loads(MANIFEST.read_text()).get(self.name)
             if ent:
@@ -55,6 +57,13 @@ class RobotSpec:
         return np.asarray(x, dtype=np.float64)
 
 
+# extra config dirs (os.pathsep-separated), searched after CFG_ROOT, e.g. the generated Unimal configs
+CFG_EXTRA = [Path(p) for p in os.environ.get("URMA_MJX_CFG_EXTRA", "").split(os.pathsep) if p]
+
+
 def load_spec(name):
-    cfg = json.loads((CFG_ROOT / f"{name}.json").read_text())
-    return RobotSpec(name, cfg)
+    for root in [CFG_ROOT] + CFG_EXTRA:
+        f = root / f"{name}.json"
+        if f.is_file():
+            return RobotSpec(name, json.loads(f.read_text()))
+    raise FileNotFoundError(f"no config for robot {name} in {[CFG_ROOT] + CFG_EXTRA}")
