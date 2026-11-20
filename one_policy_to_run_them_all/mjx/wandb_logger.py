@@ -299,11 +299,18 @@ class WandbLogger:
             _warn(f"wandb log failed, disabling wandb for this job: {e!r}")
             self._finish_quiet(1)
 
-    def log_final_eval(self, fe):
-        """Final full evaluation (campaign 6): summary keys final_eval/<robot>/reward + means (URMA / Unimal)."""
+    def log_final_eval(self, fe, step=None):
+        """Final full evaluation (campaign 6): final_eval/<robot>/{reward,ep_len,metric} + means (URMA / Unimal), logged as
+        one history row at `step` (offline-synced runs keep history reliably) and as summary keys."""
         if self.run is None:
             return
         try:
+            if step is not None:
+                m = {f"final_eval/{r}/{k}": d[src] for r, d in fe.items() for k, src in (("reward", "ep_return"), ("ep_len", "ep_length"), ("metric", "eps_track_perf"))}
+                for sub, rs in (("urma", [r for r in fe if not r.startswith("unimal_")]), ("unimal", [r for r in fe if r.startswith("unimal_")])):
+                    if rs:
+                        m[f"final_eval__{sub}__/reward"] = float(np.mean([fe[r]["ep_return"] for r in rs]))
+                self.run.log(m, step=int(step))
             for r, d in fe.items():
                 self.run.summary[f"final_eval/{r}/reward"] = d["ep_return"]
                 self.run.summary[f"final_eval/{r}/ep_len"] = d["ep_length"]

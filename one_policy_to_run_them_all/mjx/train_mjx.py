@@ -613,7 +613,7 @@ def main():
         (out / "final_eval.json").write_text(json.dumps({"iter": nr_iters, "eval_envs": a.eval_envs, "robots": fe,
                                                          "wall_s": round(time.time() - tf, 1)}, indent=1))
         if wlog is not None:
-            wlog.log_final_eval(fe)
+            wlog.log_final_eval(fe, step=nr_iters + 1)
     if a.bench_iters == 0:
         (out / "DONE").write_text(str(nr_iters))
     if wlog is not None:
